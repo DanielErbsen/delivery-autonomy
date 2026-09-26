@@ -67,38 +67,39 @@ class ControllerActionServer(Node):
         
         self.progress_idx = 0
         self.last_u = None
+        self._map_to_odom = None
 
         self.get_logger().info('Controller Action Server initialized.')
 
     def process_state_callback(self, odom_msg: Odometry):
         try:
-            t = self.tf_buffer.lookup_transform(
-                'map',
-                'base_link',
-                odom_msg.header.stamp, # Sync with the velocity measurement
-                rclpy.duration.Duration(seconds=0.1) # Small timeout
+            t = self.tf_buffer.lookup_transform('map', odom_msg.header.frame_id, rclpy.time.Time())
+            q = t.transform.rotation
+            self._map_to_odom = (
+                t.transform.translation.x,
+                t.transform.translation.y,
+                np.arctan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2)),
             )
         except TransformException as ex:
-            self.get_logger().warning(f'Could not transform map to base_link: {ex}')
-            return None
+            if self._map_to_odom is None:
+                self.get_logger().warning(
+                    f'No map->{odom_msg.header.frame_id} transform yet: {ex}', throttle_duration_sec=2.0)
+                return None
+        map_x, map_y, map_yaw = self._map_to_odom
     
-        # Extract Position in Map frame
-        x = t.transform.translation.x
-        y = t.transform.translation.y
-        
-        # Extract Yaw (theta) in Map frame
-        q = t.transform.rotation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y**2 + q.z**2)
-        theta = np.arctan2(siny_cosp, cosy_cosp)
-        
+        # Extract Position and Yaw (theta) in Map frame
+        p = odom_msg.pose.pose.position
+        q = odom_msg.pose.pose.orientation
+        c, s = np.cos(map_yaw), np.sin(map_yaw)
+        x = map_x + c * p.x - s * p.y
+        y = map_y + s * p.x + c * p.y
+        theta = map_yaw + np.arctan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
+    
         v = odom_msg.twist.twist.linear.x
         omega = odom_msg.twist.twist.angular.z
     
         # TODO: get this somehow
         b_omega = 0
-    
-        # self.get_logger().info(f"({x}, {y}) @ {theta}")
     
         self.current_state = np.array([x, y, theta, v, omega, b_omega])
 
