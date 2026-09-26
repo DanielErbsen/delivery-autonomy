@@ -161,11 +161,11 @@ class ControllerActionServer(Node):
         curr_x, curr_y = self.current_state[0], self.current_state[1]
         curr_theta = self.current_state[2]
         
-        # 3. Calculate errors
+        # Calculate errors
         dist_to_goal = np.hypot(goal_x - curr_x, goal_y - curr_y)
         yaw_err = abs((curr_theta - goal_theta + np.pi) % (2 * np.pi) - np.pi)
         
-        # 4. Check termination condition
+        # Check termination condition
         if dist_to_goal < xy_goal_tolerance and yaw_err < yaw_goal_tolerance:
             # Stop the motors
             self.publish_command(np.zeros(INPUT_DIMENSION)) 
