@@ -10,7 +10,7 @@ from autonomy.utils.mppi_step import mppi_step
 from autonomy.utils.dynamics import dynamics_model
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.task import Future
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
 import os
@@ -67,6 +67,7 @@ class ControllerActionServer(Node):
         
         self.progress_idx = 0
         self.last_u = None
+        self._goal_done = None
         self._map_to_odom = None
 
         self.get_logger().info('Controller Action Server initialized.')
@@ -122,20 +123,28 @@ class ControllerActionServer(Node):
     
         self.cmd_pub.publish(cmd_vel)
 
-    def execute_callback(self, goal_handle):
+    async def execute_callback(self, goal_handle):
         self.get_logger().info('Received a new path to follow!')
     
         path = process_path(goal_handle.request.path)
         self.current_path = path
         self.progress_idx = 0
+        # A goal that arrives mid-run takes over the path and waits on the same completion
+        if self._goal_done is None or self._goal_done.done():
+            self._goal_done = Future()
+        done = self._goal_done
         self.active_goal = True
     
-        # Block this callback until the timer thread marks it done
-        while self.active_goal and rclpy.ok():
-            time.sleep(0.05)
+        # Wait without blocking the single-threaded executor; the control loop resolves it
+        await done
     
         goal_handle.succeed()
         return FollowPath.Result(success=True)
+    
+    def _finish_goal(self):
+        self.active_goal = False
+        if self._goal_done is not None and not self._goal_done.done():
+            self._goal_done.set_result(True)
 
     def control_loop_callback(self):
         if not self.active_goal or self.current_state is None:
@@ -146,7 +155,7 @@ class ControllerActionServer(Node):
         if len(path_xy) == 0:
             self.get_logger().warning("Received empty path. Stopping robot.")
             self.publish_command(jnp.zeros(INPUT_DIMENSION)) 
-            self.active_goal = False
+            self._finish_goal()
             return
     
         # doesn't have to be calculated every step but minimal overhead
@@ -171,7 +180,7 @@ class ControllerActionServer(Node):
             # Stop the motors
             self.publish_command(np.zeros(INPUT_DIMENSION)) 
         
-            self.active_goal = False
+            self._finish_goal()
             return
     
         # Optimise from where the robot will be once this solve finishes, not where
@@ -218,11 +227,11 @@ def main(args=None):
     rclpy.init(args=args)
     node = ControllerActionServer()
 
-    # Use a multi-threaded executor so callbacks can run in parallel
-    executor = MultiThreadedExecutor()
-    
+    # Single-threaded on purpose: a MultiThreadedExecutor under ~100 Hz odometry plus /tf
+    # (and the sim's /clock) starves the 10 Hz control timer on the GIL. The action callback
+    # is async, so it does not need a thread of its own.
     try:
-        rclpy.spin(node, executor=executor)
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
