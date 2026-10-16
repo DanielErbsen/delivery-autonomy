@@ -5,24 +5,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from autonomy.utils.dynamics import dynamics_model, WHEELBASE
+from autonomy.utils.dynamics import SIM_VEHICLE, dynamics_model
 from autonomy.algorithms.mppi import mppi
 from autonomy.utils.costmap_speed import INSCRIBED, to_frame
 
 # TODO: make a parameter if you can
 DT = 0.1
 
-def dynamics_wrapper(state, action):
-    return dynamics_model(state, action, dt=DT)
-
-batch_dynamics = jax.vmap(dynamics_wrapper, in_axes=(0, 0))
+# Every rollout, one step: the same vehicle for all of them
+batch_dynamics = jax.vmap(dynamics_model, in_axes=(0, 0, None, None))
 
 sigma = jnp.array([0.35, 0.35])
 
-def ell(state, action, t, ref_traj_window, v_target):
+def ell(state, action, t, ref_traj_window, v_target, vehicle):
     x, y, theta, v, omega, b_omega = state
     v_cmd, raw_delta = action
-    delta_cmd = jnp.clip(raw_delta, -0.6, 0.6)
+    delta_cmd = jnp.clip(raw_delta, -vehicle.max_steer_rad, vehicle.max_steer_rad)
     
     target_state = ref_traj_window[t]
     x_ref, y_ref, theta_ref = target_state[0], target_state[1], target_state[2]
@@ -42,7 +40,7 @@ def ell(state, action, t, ref_traj_window, v_target):
     # Penalising the change in steering angle rather than its magnitude lets the
     # robot hold a steady curve for free while still damping rapid reversals
     safe_v = jnp.where(jnp.abs(v) < 1e-5, jnp.sign(v + 1e-10) * 1e-5, v)
-    current_delta = jnp.arctan((omega * WHEELBASE) / safe_v)
+    current_delta = jnp.arctan((omega * vehicle.wheelbase) / safe_v)
     steer_effort_cost = (delta_cmd - current_delta)**2
 
     w_cte = 90.0
@@ -157,7 +155,7 @@ def charged_steps(remaining, v_target, horizon, dt=DT):
 
 @jax.jit
 def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds, window,
-              obstacle_steps):
+              obstacle_steps, vehicle=SIM_VEHICLE):
     """
     x0: (STATE_DIMENSION,)
     U_nominal: (T, INPUT_DIMENSION)
@@ -166,6 +164,7 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
     window: CostWindow, the costmap round the robot (free_window() for none)
     obstacle_steps: int32, the obstacle cost counts for the states before this step (T + 1: all
         of them, the final state too)
+    vehicle: Vehicle, the car the rollouts drive
     """
     T = U_nominal.shape[0]
     ref_costs = jax.vmap(cell_cost, in_axes=(0, None))(ref_traj, window)
@@ -175,7 +174,7 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
 
     # Create closures that inject ref_traj into the unbatched functions
     def ell_closure(state, action, t):
-        return (ell(state, action, t, ref_traj, v_target)
+        return (ell(state, action, t, ref_traj, v_target, vehicle)
                 + jnp.where(t < obstacle_steps, obstacles(state), 0.0))
 
     def phi_closure(state):
@@ -188,7 +187,7 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
 
     return mppi(
         key=key, 
-        f=batch_dynamics,
+        f=lambda states, actions: batch_dynamics(states, actions, DT, vehicle),
         x0=x0, 
         U=U_nominal, 
         phi=batch_phi, 
