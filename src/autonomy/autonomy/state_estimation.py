@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from autonomy.utils.sensors import MEASUREMENT_FCNS
-from autonomy.utils.dynamics import STATE_DIMENSION, INPUT_DIMENSION, WHEELBASE
+from autonomy.utils.dynamics import STATE_DIMENSION, INPUT_DIMENSION, SIM_VEHICLE
 from autonomy.utils.rpy_to_quaternion import rpy_to_quaternion
 from autonomy.utils.latlon2meters import latlon2meters 
 from nav_msgs.msg import Odometry
@@ -147,7 +147,7 @@ class DeliveryStateEstimationNode(Node):
             delta = 0.0
         else:
             # Calculate steering angle required to achieve the commanded yaw rate
-            delta = math.atan((omega_cmd * WHEELBASE) / v_cmd)
+            delta = math.atan((omega_cmd * SIM_VEHICLE.wheelbase) / v_cmd)
     
         self.current_u = jnp.array([v_cmd, delta], dtype=jnp.float32)
 

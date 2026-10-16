@@ -137,45 +137,73 @@ for some motor constant $\tau$ and wheelbase $L$. Motor acceleration is essentia
 
 Euler is only stable for a DT of $< 2\tau \approx 0.02$ seconds, but MPPI and the EKF predict over longer horizons, which amplifies error and explodes the state. We therefore use the closed-form update, which is stable for any DT.
 
+The car itself is a ~Vehicle~: its wheelbase, its steering limit, the two lags and the drive's acceleration limit. The defaults, ~SIM_VEHICLE~, were fitted to the Gazebo car. The real robot is shorter and steers less (0.363 m, 0.436 rad), so the controller takes all five as parameters (see [[*Parameters][Parameters]]). The vehicle is an argument of the jitted model, not a set of constants compiled into it: a new one, even at runtime, does not make jax compile the model or MPPI's step again. Leaving it out models the sim car. The EKF does that.
+
+A vehicle the model cannot use is refused: the wheelbase must be positive and the steering limit below $\pi/2$, where $\tan \delta$ blows up (delivery-robo's arduino_bridge checks its own copies the same way). The lags and the acceleration limit must be positive because the closed form divides by them.
+
 #+begin_src python :noweb yes :tangle ../src/autonomy/autonomy/utils/dynamics.py
+import math
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 
 STATE_DIMENSION = 6
 INPUT_DIMENSION = 2
-WHEELBASE = 0.5  # Must match <wheel_base> in the robot description / Ackermann plugin
-MAX_STEER = 0.6
-DRIVE_TAU = 0.01
-STEER_TAU = 0.545
-MAX_ACCEL = 5.0
+
+
+class Vehicle(NamedTuple):
+    wheelbase: float = 0.5        # m, rear axle to front axle. The sim's is <wheel_base> in the robot description
+    max_steer_rad: float = 0.6    # rad, the steering limit either way
+    steer_tau: float = 0.545      # s, time constant of the steering
+    drive_tau: float = 0.01       # s, time constant of the speed
+    max_accel: float = 5.0        # m/s^2, the drive's acceleration limit
+
+
+SIM_VEHICLE = Vehicle()
+VEHICLE_PARAMS = SIM_VEHICLE._asdict()
+
+
+def vehicle_param_problem(wheelbase, max_steer_rad, steer_tau, drive_tau, max_accel):
+    """Return why this vehicle cannot be modelled, or None when it can."""
+    for name, value in (('wheelbase', wheelbase), ('steer_tau', steer_tau),
+                        ('drive_tau', drive_tau), ('max_accel', max_accel)):
+        if not 0.0 < value < math.inf:
+            return f'{name} must be positive, got {value}'
+    if not 0.0 < max_steer_rad < math.pi / 2:
+        return f'max_steer_rad must be in (0, pi/2) rad, got {max_steer_rad}'
+    return None
+
 
 @jax.jit
-def dynamics_model(state: jnp.ndarray, inputs: jnp.ndarray, dt: float) -> jnp.ndarray:
+def dynamics_model(state: jnp.ndarray, inputs: jnp.ndarray, dt: float,
+                   vehicle: Vehicle = SIM_VEHICLE) -> jnp.ndarray:
     x, y, theta, v, omega, b_omega = state
     v_cmd, delta_cmd = inputs
+    wheelbase, max_steer, steer_tau, drive_tau, max_accel = vehicle
 
     # Closed form acceleration
     v_gap = v_cmd - v
-    accel = jnp.clip(v_gap / DRIVE_TAU, -MAX_ACCEL, MAX_ACCEL)
+    accel = jnp.clip(v_gap / drive_tau, -max_accel, max_accel)
 
     # Time spent at full acceleration before the
     # remaining gap is small enough
     t_clipped = jnp.clip(
-        (jnp.abs(v_gap) - MAX_ACCEL * DRIVE_TAU) / MAX_ACCEL, 0.0, dt)
+        (jnp.abs(v_gap) - max_accel * drive_tau) / max_accel, 0.0, dt)
     next_v = (v + accel * t_clipped
               + (v_gap - accel * t_clipped)
-              ,* (1.0 - jnp.exp(-(dt - t_clipped) / DRIVE_TAU)))
+              ,* (1.0 - jnp.exp(-(dt - t_clipped) / drive_tau)))
 
     # Recover the steering angle implied by the current yaw rate, holding the
     # sign through the zero crossing to avoid a singularity
     safe_v = jnp.where(jnp.abs(v) < 1e-5, jnp.sign(v + 1e-10) * 1e-5, v)
-    current_delta = jnp.arctan((omega * WHEELBASE) / safe_v)
+    current_delta = jnp.arctan((omega * wheelbase) / safe_v)
 
-    delta_cmd = jnp.clip(delta_cmd, -MAX_STEER, MAX_STEER)
+    delta_cmd = jnp.clip(delta_cmd, -max_steer, max_steer)
     # closed form
-    next_delta = delta_cmd + (current_delta - delta_cmd) * jnp.exp(-dt / STEER_TAU)
+    next_delta = delta_cmd + (current_delta - delta_cmd) * jnp.exp(-dt / steer_tau)
 
-    next_omega = (next_v / WHEELBASE) * jnp.tan(next_delta)
+    next_omega = (next_v / wheelbase) * jnp.tan(next_delta)
 
     theta_mid = theta + 0.5 * next_omega * dt
     next_x = x + next_v * jnp.cos(theta_mid) * dt
@@ -187,6 +215,72 @@ def dynamics_model(state: jnp.ndarray, inputs: jnp.ndarray, dt: float) -> jnp.nd
     return jnp.array([next_x, next_y, next_theta, next_v, next_omega, b_omega])
 #+end_src
 
+The tests check what each field does to the model: the circle at full lock, the speed after one step from rest, the steering after one step from straight ahead.
+
+#+begin_src python :tangle ../src/autonomy/test/test_vehicle.py :mkdirp yes
+import math
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from autonomy.utils.dynamics import (
+    INPUT_DIMENSION, SIM_VEHICLE, VEHICLE_PARAMS, Vehicle, dynamics_model, vehicle_param_problem)
+
+# The real robot's geometry (delivery-robo hardware.yaml: wheelbase, max_steer_rad); its lags are unmeasured
+ROBOT_TDM41 = Vehicle(wheelbase=0.36322, max_steer_rad=0.4363)
+
+
+def test_defaults_are_the_sim_car_and_valid():
+    assert SIM_VEHICLE == Vehicle(0.5, 0.6, 0.545, 0.01, 5.0)
+    assert vehicle_param_problem(**VEHICLE_PARAMS) is None
+    assert vehicle_param_problem(**ROBOT_TDM41._asdict()) is None
+
+
+@pytest.mark.parametrize('name, value', [
+    ('wheelbase', 0.0), ('wheelbase', -0.36), ('wheelbase', math.inf), ('wheelbase', math.nan),
+    ('max_steer_rad', 0.0), ('max_steer_rad', -0.44), ('max_steer_rad', math.pi / 2),
+    ('max_steer_rad', math.nan), ('steer_tau', 0.0), ('drive_tau', -0.01), ('max_accel', 0.0)])
+def test_unusable_vehicles_are_refused(name, value):
+    assert vehicle_param_problem(**{**VEHICLE_PARAMS, name: value}) is not None
+
+
+def turning_radius_tdm41(vehicle, delta_cmd, v=1.0, seconds=8.0):
+    """Radius of the circle the model settles on at v with delta_cmd held, from straight ahead."""
+    state = jnp.array([0.0, 0.0, 0.0, v, 0.0, 0.0])
+    for _ in range(round(seconds / 0.1)):
+        state = dynamics_model(state, jnp.array([v, delta_cmd]), 0.1, vehicle)
+    return v / float(state[4])
+
+
+def test_full_lock_turns_on_the_vehicles_smallest_circle():
+    assert turning_radius_tdm41(SIM_VEHICLE, 1.0) == pytest.approx(0.5 / math.tan(0.6), rel=1e-3)
+    assert turning_radius_tdm41(ROBOT_TDM41, 1.0) == pytest.approx(0.36322 / math.tan(0.4363), rel=1e-3)
+    # Within the limit the angle is the angle: the wheelbase alone sets the radius
+    assert turning_radius_tdm41(ROBOT_TDM41, 0.2) == pytest.approx(0.36322 / math.tan(0.2), rel=1e-3)
+
+
+def test_the_lags_and_the_acceleration_limit_are_the_vehicles():
+    rest, go = jnp.zeros(6), jnp.array([1.5, 0.0])
+    assert float(dynamics_model(rest, go, 0.1)[3]) == pytest.approx(0.5, abs=1e-4)  # 5 m/s^2 for 0.1 s
+    gentle = SIM_VEHICLE._replace(max_accel=2.0)
+    assert float(dynamics_model(rest, go, 0.1, gentle)[3]) == pytest.approx(0.2, abs=1e-4)
+    sluggish = SIM_VEHICLE._replace(drive_tau=1.0, max_accel=100.0)
+    assert float(dynamics_model(rest, go, 0.1, sluggish)[3]) == pytest.approx(
+        1.5 * (1.0 - math.exp(-0.1)), rel=1e-4)
+    straight, turn = jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]), jnp.array([1.0, 0.3])
+    for tau in (0.545, 0.2):
+        omega = float(dynamics_model(straight, turn, 0.1, SIM_VEHICLE._replace(steer_tau=tau))[4])
+        assert math.atan(omega * 0.5) == pytest.approx(0.3 * (1.0 - math.exp(-0.1 / tau)), rel=1e-4)
+
+
+def test_leaving_the_vehicle_out_models_the_sim_car():
+    state, u = jnp.array([1.0, 2.0, 0.3, 0.8, 0.2, 0.0]), jnp.array([1.2, 0.4])
+    np.testing.assert_array_equal(dynamics_model(state, u, 0.1),
+                                  dynamics_model(state, u, 0.1, SIM_VEHICLE))
+#+end_src
+
 * State Estimation
 State estimation tells us where the robot is located in the world and how it is moving. This is performed using an [[id:609b408b-0ed9-411f-81b1-f7f7fdd0f7fb][Extended Kalman Filter]], the math for which I will not cover here.
 
@@ -194,7 +288,7 @@ State estimation tells us where the robot is located in the world and how it is 
 import rclpy
 from rclpy.node import Node
 from autonomy.utils.sensors import MEASUREMENT_FCNS
-from autonomy.utils.dynamics import STATE_DIMENSION, INPUT_DIMENSION, WHEELBASE
+from autonomy.utils.dynamics import STATE_DIMENSION, INPUT_DIMENSION, SIM_VEHICLE
 from autonomy.utils.rpy_to_quaternion import rpy_to_quaternion
 from autonomy.utils.latlon2meters import latlon2meters 
 from nav_msgs.msg import Odometry
@@ -575,6 +669,8 @@ MEASUREMENT_FCNS = {
 ** Control Input
 The EKF also considers the commanded velocity we have given the robot.
 
+Its model is the sim car (=SIM_VEHICLE=), on the robot too. The yaw rate is turned back into a steering angle with that model's own wheelbase, so the model reproduces the commanded curvature exactly. The robot's tightest turn (0.4363 rad on 0.36322 m) is 0.571 rad on the sim car's 0.5 m, inside its 0.6 rad limit.
+
 #+name: cmd_sub
 #+begin_src python
 self.current_u = jnp.zeros(INPUT_DIMENSION, dtype=jnp.float32)
@@ -598,7 +694,7 @@ def process_cmd_vel_callback(self, msg: Twist):
         delta = 0.0
     else:
         # Calculate steering angle required to achieve the commanded yaw rate
-        delta = math.atan((omega_cmd * WHEELBASE) / v_cmd)
+        delta = math.atan((omega_cmd * SIM_VEHICLE.wheelbase) / v_cmd)
 
     self.current_u = jnp.array([v_cmd, delta], dtype=jnp.float32)
 #+end_src
@@ -1117,7 +1213,7 @@ from shared_types.action import FollowPath
 from autonomy.utils.dynamics import INPUT_DIMENSION
 from autonomy.utils.reference_trajectory import process_path, get_local_reference
 from autonomy.utils.mppi_step import charged_steps, crop_window, free_window, mppi_step
-from autonomy.utils.dynamics import dynamics_model
+from autonomy.utils.dynamics import VEHICLE_PARAMS, Vehicle, dynamics_model, vehicle_param_problem
 from autonomy.utils.costmap_speed import (
     GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
     speed_limit)
@@ -1340,7 +1436,19 @@ With =use_costmap= true and no costmap at all (Nav2 not running), the robot only
 
 They can be set at launch (e.g. ~max_speed:=0.8~; write doubles, ~1.0~ not ~1~) or changed while running with ~ros2 param set /controller_server max_speed 0.8~. A value that fails the checks below is refused: at startup the node will not start, and at runtime the set is rejected with the reason. Speeds are checked against the range MPPI is tuned for. Up to 1.5 m/s its 5 s rollouts also stay inside the costmap window ([[*Obstacle Cost][Obstacle Cost]]). MPPI samples speeds between =min_speed= and the tick's target speed, the same bounds the command is clipped to. =min_speed= may not be positive, or the stop command (zero) would be clipped into motion.
 
-The vehicle geometry is *not* a parameter. =WHEELBASE= and =MAX_STEER= (=utils/dynamics.py=) and MPPI's own constants are compiled into the jitted step. =steering_wheel_base= below has to match =WHEELBASE=. They describe the simulated vehicle (0.5 m, 0.6 rad). The real robot is 0.363 m and 0.436 rad, so changing them is a code change.
+The car MPPI drives in its rollouts has parameters too (the =Vehicle= of [[*Dynamics][Dynamics]]). Their defaults are the sim car's, so the sim sets none of them:
+
+| Parameter       | Default | Meaning                                                                                      |
+|-----------------+---------+----------------------------------------------------------------------------------------------|
+| =wheelbase=     |     0.5 | m. Rear axle to front axle: MPPI's model, and the yaw rate sent for its steering angle.      |
+| =max_steer_rad= |     0.6 | rad. The steering limit either way. MPPI samples within it and the command is clipped to it. |
+| =steer_tau=     |   0.545 | s. Time constant of the steering.                                                            |
+| =drive_tau=     |    0.01 | s. Time constant of the speed.                                                               |
+| =max_accel=     |     5.0 | m/s². The drive's acceleration limit.                                                        |
+
+They used to be constants of the sim car. On the robot, MPPI then believed it could turn on a 0.73 m radius where the robot manages 0.78 m. Curvature still came out right below that, because the arduino_bridge turns the yaw rate back into an angle with the real wheelbase. Any model angle above 0.570 rad was clipped at the robot's 0.4363 rad, though, and the robot turned up to 6.6 % wider than MPPI predicted. =wheelbase= and =max_steer_rad= are named like the values delivery-robo's hardware.yaml shares between its nodes, so the robot's one measured wheelbase and steering limit reach this controller and the bridge alike. Nobody has measured the robot's lags yet. Until someone does, it keeps the sim's.
+
+The vehicle is passed to the jitted step as an argument, not compiled in. A new value at runtime does not compile it again, as long as it is plain floats every time (=vehicle_from=). In the sim, keep the defaults: the Gazebo car stays 0.5 m and 0.6 rad whatever the controller believes.
 
 #+name: param_checks
 #+begin_src python
@@ -1367,15 +1475,24 @@ def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_t
     return None
 
 def param_problem(settings):
-    """Check a full set of controller and speed-limit settings (a dict by parameter name)."""
+    """Check a full set of controller, speed-limit and vehicle settings (a dict by parameter name)."""
     return (controller_param_problem(**{name: settings[name] for name in CONTROLLER_PARAMS})
-            or governor_param_problem(**{name: settings[name] for name in GOVERNOR_PARAMS}))
+            or governor_param_problem(**{name: settings[name] for name in GOVERNOR_PARAMS})
+            or vehicle_param_problem(**{name: settings[name] for name in VEHICLE_PARAMS}))
+
+def vehicle_from(settings):
+    """The Vehicle for a set of settings. Plain floats every time, so jax never compiles again."""
+    return Vehicle(**{name: float(settings[name]) for name in VEHICLE_PARAMS})
 #+end_src
 
 The checks don't touch ROS, so they get a plain pytest (=python -m pytest src/autonomy/test= with the workspace sourced).
 
 #+begin_src python :tangle ../src/autonomy/test/test_controller_params.py :mkdirp yes
-from autonomy.controller import CONTROLLER_PARAMS, controller_param_problem
+import numpy as np
+
+from autonomy.controller import CONTROLLER_PARAMS, controller_param_problem, param_problem, vehicle_from
+from autonomy.utils.costmap_speed import GOVERNOR_PARAMS
+from autonomy.utils.dynamics import VEHICLE_PARAMS, Vehicle
 
 
 def test_defaults_are_accepted():
@@ -1395,16 +1512,34 @@ def test_slow_and_forward_only_settings_are_accepted():
 def test_tolerances_must_be_positive():
     for name in ('xy_goal_tolerance', 'yaw_goal_tolerance'):
         assert controller_param_problem(**{**CONTROLLER_PARAMS, name: 0.0}) is not None, name
+
+
+def test_the_vehicle_is_checked_with_the_rest():
+    defaults = {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS, **VEHICLE_PARAMS}
+    assert param_problem(defaults) is None
+    assert param_problem({**defaults, 'wheelbase': 0.36322, 'max_steer_rad': 0.4363}) is None
+    for name, value in [('wheelbase', 0.0), ('max_steer_rad', 1.6), ('steer_tau', 0.0),
+                        ('drive_tau', -0.01), ('max_accel', 0.0)]:
+        assert param_problem({**defaults, name: value}) is not None, (name, value)
+
+
+def test_the_vehicle_is_plain_floats():
+    settings = {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS, **VEHICLE_PARAMS, 'wheelbase': np.float64(0.36322)}
+    vehicle = vehicle_from(settings)
+    assert vehicle == Vehicle(wheelbase=0.36322)
+    assert all(type(value) is float for value in vehicle)
 #+end_src
 
 #+name: controller_params
 #+begin_src python
-self.param_names = (*CONTROLLER_PARAMS, *GOVERNOR_PARAMS)
-for name, default in {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS}.items():
+self.param_names = (*CONTROLLER_PARAMS, *GOVERNOR_PARAMS, *VEHICLE_PARAMS)
+for name, default in {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS, **VEHICLE_PARAMS}.items():
     setattr(self, name, self.declare_parameter(name, default).value)
-problem = param_problem({name: getattr(self, name) for name in self.param_names})
+settings = {name: getattr(self, name) for name in self.param_names}
+problem = param_problem(settings)
 if problem:
     raise ValueError(problem)
+self.vehicle = vehicle_from(settings)
 self.add_on_set_parameters_callback(self.on_set_parameters)
 #+end_src
 
@@ -1420,6 +1555,7 @@ def on_set_parameters(self, params):
         return SetParametersResult(successful=False, reason=problem)
     for name, value in settings.items():
         setattr(self, name, value)
+    self.vehicle = vehicle_from(settings)
     return SetParametersResult(successful=True)
 #+end_src
 
@@ -1431,7 +1567,7 @@ self.cmd_pub = self.create_publisher(
 )
 #+end_src
 
-Whatever MPPI asks for, the speed sent is held between =min_speed= and =max_speed=.
+Whatever MPPI asks for, the speed sent is held between =min_speed= and =max_speed=, and the steering angle within =max_steer_rad=. The angle goes out as a yaw rate, converted with the =wheelbase= MPPI planned with. Whoever turns it back into an angle with the same wheelbase gets MPPI's angle. On the robot that is the arduino_bridge, with the same hardware.yaml value.
 
 #+name: publish_command
 #+begin_src python
@@ -1441,10 +1577,9 @@ def publish_command(self, u):
     v_cmd_float = float(v_cmd)
     delta_float = float(delta)
 
-    max_steer = 0.6
     v_cmd_float = max(min(v_cmd_float, self.max_speed), self.min_speed)
-    delta_clipped = np.clip(delta_float, -max_steer, max_steer)
-    omega = (v_cmd_float / self.steering_wheel_base) * np.tan(delta_clipped)
+    delta_clipped = np.clip(delta_float, -self.max_steer_rad, self.max_steer_rad)
+    omega = (v_cmd_float / self.wheelbase) * np.tan(delta_clipped)
 
     cmd_vel = Twist()
 
@@ -1498,7 +1633,6 @@ The control loop is the heart of the controller. It receives the current path an
 #+name: control_vars
 #+begin_src python
 self.T = 50 # TODO: make param
-self.steering_wheel_base = 0.5  # Must match <wheel_base> in robot.urdf.xacro
 self.dt = 0.1
 self.rng = jax.random.PRNGKey(42)
 self.U_nominal = jnp.zeros((self.T, INPUT_DIMENSION))
@@ -1534,7 +1668,7 @@ def control_loop_callback(self):
 
     # Optimise from where the robot will be once this solve finishes, not where
     # it was when the solve started
-    future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt) if self.last_u is not None else self.current_state
+    future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt, vehicle=self.vehicle) if self.last_u is not None else self.current_state
 
     # Brake in time to stop at the end of the path (see End of Path)
     remaining = path_s[-1] - path_progress(future_state, path_xy, path_s, self.progress_idx)
@@ -1566,8 +1700,8 @@ def control_loop_callback(self):
 
     # [min_v, min_delta]. The speed cap is this tick's target, so a lowered target
     # caps the command too. MPPI samples within the same bounds (see MPPI).
-    lower_bounds = jnp.array([self.min_speed, -0.6])
-    upper_bounds = jnp.array([V_TARGET, 0.6])
+    lower_bounds = jnp.array([self.min_speed, -self.max_steer_rad])
+    upper_bounds = jnp.array([V_TARGET, self.max_steer_rad])
 
     U_opt = mppi_step(
         key=iter_key,
@@ -1582,6 +1716,7 @@ def control_loop_callback(self):
         # a rollout could have reached the end of the path (see Obstacle Cost)
         window=self.mppi_costmap_window(future_state),
         obstacle_steps=charged_steps(remaining, V_TARGET, self.T),
+        vehicle=self.vehicle,
     )
 
     U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
@@ -2160,9 +2295,11 @@ def get_local_reference(state, path_xy, path_theta_unwrapped, path_s, T, dt, v_t
 *** MPPI
 See [[id:4f1361c2-eb14-466a-a692-45fbd9c34e47][Model Predictive Path Integral]].
 
-The step takes its speed and steering bounds as arguments. The controller passes =[min_speed, -0.6]= to =[v_target, 0.6]=, the same bounds it clips the result to, so MPPI no longer spends samples on speeds the controller would clip anyway. Before, the bounds were fixed at -0.5 to 1.5 m/s, and with the target lowered to 0.3 m/s near an obstacle most of the samples were faster than anything that could be sent. They are arrays of a fixed shape, so a new value never makes jax compile the step again.
+The step takes its speed and steering bounds as arguments. The controller passes =[min_speed, -max_steer_rad]= to =[v_target, max_steer_rad]=, the same bounds it clips the result to, so MPPI no longer spends samples on speeds the controller would clip anyway. Before, the bounds were fixed at -0.5 to 1.5 m/s, and with the target lowered to 0.3 m/s near an obstacle most of the samples were faster than anything that could be sent. They are arrays of a fixed shape, so a new value never makes jax compile the step again.
 
 Each rollout also pays for the costmap cells it drives through (see [[*Obstacle Cost][Obstacle Cost]]). That cost is added on top of the path-tracking costs, so ~ell~ and ~phi~ themselves are unchanged.
+
+The rollouts drive the controller's =Vehicle= (see [[*Parameters][Parameters]]), passed in for the same reason as the bounds. Without one they drive the sim car. ~ell~ needs it too: it recovers the current steering angle from the yaw rate with the wheelbase.
 
 #+begin_src python :tangle ../src/autonomy/autonomy/utils/mppi_step.py :noweb yes
 import math
@@ -2172,17 +2309,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from autonomy.utils.dynamics import dynamics_model, WHEELBASE
+from autonomy.utils.dynamics import SIM_VEHICLE, dynamics_model
 from autonomy.algorithms.mppi import mppi
 from autonomy.utils.costmap_speed import INSCRIBED, to_frame
 
 # TODO: make a parameter if you can
 DT = 0.1
 
-def dynamics_wrapper(state, action):
-    return dynamics_model(state, action, dt=DT)
-
-batch_dynamics = jax.vmap(dynamics_wrapper, in_axes=(0, 0))
+# Every rollout, one step: the same vehicle for all of them
+batch_dynamics = jax.vmap(dynamics_model, in_axes=(0, 0, None, None))
 
 sigma = jnp.array([0.35, 0.35])
 
@@ -2196,7 +2331,7 @@ sigma = jnp.array([0.35, 0.35])
 
 @jax.jit
 def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds, window,
-              obstacle_steps):
+              obstacle_steps, vehicle=SIM_VEHICLE):
     """
     x0: (STATE_DIMENSION,)
     U_nominal: (T, INPUT_DIMENSION)
@@ -2205,6 +2340,7 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
     window: CostWindow, the costmap round the robot (free_window() for none)
     obstacle_steps: int32, the obstacle cost counts for the states before this step (T + 1: all
         of them, the final state too)
+    vehicle: Vehicle, the car the rollouts drive
     """
     T = U_nominal.shape[0]
     ref_costs = jax.vmap(cell_cost, in_axes=(0, None))(ref_traj, window)
@@ -2214,7 +2350,7 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
 
     # Create closures that inject ref_traj into the unbatched functions
     def ell_closure(state, action, t):
-        return (ell(state, action, t, ref_traj, v_target)
+        return (ell(state, action, t, ref_traj, v_target, vehicle)
                 + jnp.where(t < obstacle_steps, obstacles(state), 0.0))
 
     def phi_closure(state):
@@ -2227,7 +2363,7 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
 
     return mppi(
         key=key, 
-        f=batch_dynamics,
+        f=lambda states, actions: batch_dynamics(states, actions, DT, vehicle),
         x0=x0, 
         U=U_nominal, 
         phi=batch_phi, 
@@ -2240,12 +2376,52 @@ def mppi_step(key, x0, U_nominal, ref_traj, v_target, lower_bounds, upper_bounds
     )
 #+end_src
 
+Two tests for the vehicle argument. A new vehicle does not compile the step again. And already turning steadily round a 2 m circle, MPPI plans the steering angle its own vehicle needs to stay on it, $\arctan(L/2)$: 0.245 rad for the sim car, 0.180 rad for the robot. The test repeats the step from that one state until the plan settles, then averages its first 4 s. The first command alone scatters by about 0.15 rad (standard deviation) from tick to tick.
+
+#+begin_src python :tangle ../src/autonomy/test/test_vehicle.py
+from autonomy.utils.mppi_step import free_window, mppi_step
+from autonomy.utils.reference_trajectory import get_local_reference
+
+
+def circle_plan_tdm41(vehicle, iterations=10, radius=2.0, v=1.0):
+    """The steering MPPI plans with `vehicle` on a left-hand circle, from a state turning steadily
+    on it, after `iterations` steps from that one state (warm started, clipped like the
+    controller's)."""
+    s = np.arange(0.0, 1.5 * math.pi * radius, 0.05)
+    path_xy = np.stack([radius * np.sin(s / radius), radius * (1.0 - np.cos(s / radius))], axis=-1)
+    state = np.array([0.0, 0.0, 0.0, v, v / radius, 0.0])
+    ref, _ = get_local_reference(state, path_xy, s / radius, s, 50, 0.1, v_target=v)
+    lower = jnp.array([0.0, -vehicle.max_steer_rad])
+    upper = jnp.array([v, vehicle.max_steer_rad])
+    U = jnp.zeros((50, INPUT_DIMENSION)).at[:, 0].set(v)
+    key = jax.random.PRNGKey(0)
+    for _ in range(iterations):
+        key, sub = jax.random.split(key)
+        U = jnp.clip(mppi_step(sub, state, U, jnp.array(ref), v, lower, upper, free_window(),
+                               np.int32(51), vehicle=vehicle), lower, upper)
+    return np.asarray(U[:, 1])
+
+
+def test_a_new_vehicle_does_not_compile_the_step_again():
+    circle_plan_tdm41(SIM_VEHICLE, iterations=1)
+    compiled = mppi_step._cache_size()
+    circle_plan_tdm41(ROBOT_TDM41, iterations=1)
+    circle_plan_tdm41(Vehicle(0.4, 0.5, 0.3, 0.05, 2.0), iterations=1)
+    assert mppi_step._cache_size() == compiled
+
+
+def test_mppi_plans_the_steering_its_vehicle_needs():
+    for vehicle in (SIM_VEHICLE, ROBOT_TDM41):
+        planned = float(circle_plan_tdm41(vehicle)[:40].mean())
+        assert planned == pytest.approx(math.atan(vehicle.wheelbase / 2.0), abs=0.02), vehicle
+#+end_src
+
 #+name: running_cost
 #+begin_src python
-def ell(state, action, t, ref_traj_window, v_target):
+def ell(state, action, t, ref_traj_window, v_target, vehicle):
     x, y, theta, v, omega, b_omega = state
     v_cmd, raw_delta = action
-    delta_cmd = jnp.clip(raw_delta, -0.6, 0.6)
+    delta_cmd = jnp.clip(raw_delta, -vehicle.max_steer_rad, vehicle.max_steer_rad)
     
     target_state = ref_traj_window[t]
     x_ref, y_ref, theta_ref = target_state[0], target_state[1], target_state[2]
@@ -2265,7 +2441,7 @@ def ell(state, action, t, ref_traj_window, v_target):
     # Penalising the change in steering angle rather than its magnitude lets the
     # robot hold a steady curve for free while still damping rapid reversals
     safe_v = jnp.where(jnp.abs(v) < 1e-5, jnp.sign(v + 1e-10) * 1e-5, v)
-    current_delta = jnp.arctan((omega * WHEELBASE) / safe_v)
+    current_delta = jnp.arctan((omega * vehicle.wheelbase) / safe_v)
     steer_effort_cost = (delta_cmd - current_delta)**2
 
     w_cte = 90.0

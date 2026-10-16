@@ -15,7 +15,7 @@ from shared_types.action import FollowPath
 from autonomy.utils.dynamics import INPUT_DIMENSION
 from autonomy.utils.reference_trajectory import process_path, get_local_reference
 from autonomy.utils.mppi_step import charged_steps, crop_window, free_window, mppi_step
-from autonomy.utils.dynamics import dynamics_model
+from autonomy.utils.dynamics import VEHICLE_PARAMS, Vehicle, dynamics_model, vehicle_param_problem
 from autonomy.utils.costmap_speed import (
     GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
     speed_limit)
@@ -51,9 +51,14 @@ def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_t
     return None
 
 def param_problem(settings):
-    """Check a full set of controller and speed-limit settings (a dict by parameter name)."""
+    """Check a full set of controller, speed-limit and vehicle settings (a dict by parameter name)."""
     return (controller_param_problem(**{name: settings[name] for name in CONTROLLER_PARAMS})
-            or governor_param_problem(**{name: settings[name] for name in GOVERNOR_PARAMS}))
+            or governor_param_problem(**{name: settings[name] for name in GOVERNOR_PARAMS})
+            or vehicle_param_problem(**{name: settings[name] for name in VEHICLE_PARAMS}))
+
+def vehicle_from(settings):
+    """The Vehicle for a set of settings. Plain floats every time, so jax never compiles again."""
+    return Vehicle(**{name: float(settings[name]) for name in VEHICLE_PARAMS})
 
 class ControllerActionServer(Node):
     def __init__(self):
@@ -104,16 +109,17 @@ class ControllerActionServer(Node):
             Twist, "/cmd_vel", 10
         )
 
-        self.param_names = (*CONTROLLER_PARAMS, *GOVERNOR_PARAMS)
-        for name, default in {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS}.items():
+        self.param_names = (*CONTROLLER_PARAMS, *GOVERNOR_PARAMS, *VEHICLE_PARAMS)
+        for name, default in {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS, **VEHICLE_PARAMS}.items():
             setattr(self, name, self.declare_parameter(name, default).value)
-        problem = param_problem({name: getattr(self, name) for name in self.param_names})
+        settings = {name: getattr(self, name) for name in self.param_names}
+        problem = param_problem(settings)
         if problem:
             raise ValueError(problem)
+        self.vehicle = vehicle_from(settings)
         self.add_on_set_parameters_callback(self.on_set_parameters)
 
         self.T = 50 # TODO: make param
-        self.steering_wheel_base = 0.5  # Must match <wheel_base> in robot.urdf.xacro
         self.dt = 0.1
         self.rng = jax.random.PRNGKey(42)
         self.U_nominal = jnp.zeros((self.T, INPUT_DIMENSION))
@@ -177,6 +183,7 @@ class ControllerActionServer(Node):
             return SetParametersResult(successful=False, reason=problem)
         for name, value in settings.items():
             setattr(self, name, value)
+        self.vehicle = vehicle_from(settings)
         return SetParametersResult(successful=True)
 
     def publish_command(self, u):
@@ -185,10 +192,9 @@ class ControllerActionServer(Node):
         v_cmd_float = float(v_cmd)
         delta_float = float(delta)
     
-        max_steer = 0.6
         v_cmd_float = max(min(v_cmd_float, self.max_speed), self.min_speed)
-        delta_clipped = np.clip(delta_float, -max_steer, max_steer)
-        omega = (v_cmd_float / self.steering_wheel_base) * np.tan(delta_clipped)
+        delta_clipped = np.clip(delta_float, -self.max_steer_rad, self.max_steer_rad)
+        omega = (v_cmd_float / self.wheelbase) * np.tan(delta_clipped)
     
         cmd_vel = Twist()
     
@@ -261,7 +267,7 @@ class ControllerActionServer(Node):
     
         # Optimise from where the robot will be once this solve finishes, not where
         # it was when the solve started
-        future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt) if self.last_u is not None else self.current_state
+        future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt, vehicle=self.vehicle) if self.last_u is not None else self.current_state
     
         # Brake in time to stop at the end of the path (see End of Path)
         remaining = path_s[-1] - path_progress(future_state, path_xy, path_s, self.progress_idx)
@@ -293,8 +299,8 @@ class ControllerActionServer(Node):
     
         # [min_v, min_delta]. The speed cap is this tick's target, so a lowered target
         # caps the command too. MPPI samples within the same bounds (see MPPI).
-        lower_bounds = jnp.array([self.min_speed, -0.6])
-        upper_bounds = jnp.array([V_TARGET, 0.6])
+        lower_bounds = jnp.array([self.min_speed, -self.max_steer_rad])
+        upper_bounds = jnp.array([V_TARGET, self.max_steer_rad])
     
         U_opt = mppi_step(
             key=iter_key,
@@ -309,6 +315,7 @@ class ControllerActionServer(Node):
             # a rollout could have reached the end of the path (see Obstacle Cost)
             window=self.mppi_costmap_window(future_state),
             obstacle_steps=charged_steps(remaining, V_TARGET, self.T),
+            vehicle=self.vehicle,
         )
     
         U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
