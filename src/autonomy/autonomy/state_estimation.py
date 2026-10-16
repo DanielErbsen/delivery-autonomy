@@ -99,7 +99,8 @@ class DeliveryStateEstimationNode(Node):
         timestamp = msg.header.stamp.sec + (msg.header.stamp.nanosec * 1e-9)
     
         if not self.received_first_gps:
-            self.get_logger().info('Setting GPS datum and initializing state to (0,0)')
+            self.get_logger().info(
+                f'GPS datum {msg.latitude:.8f}, {msg.longitude:.8f}: initializing state to (0,0)')
             self.origin_lat = lat_rad
             self.origin_lon = lon_rad
             self.received_first_gps = True

@@ -392,7 +392,8 @@ def process_gps_callback(self, msg: NavSatFix):
     timestamp = msg.header.stamp.sec + (msg.header.stamp.nanosec * 1e-9)
 
     if not self.received_first_gps:
-        self.get_logger().info('Setting GPS datum and initializing state to (0,0)')
+        self.get_logger().info(
+            f'GPS datum {msg.latitude:.8f}, {msg.longitude:.8f}: initializing state to (0,0)')
         self.origin_lat = lat_rad
         self.origin_lon = lon_rad
         self.received_first_gps = True
@@ -415,18 +416,108 @@ def process_gps_callback(self, msg: NavSatFix):
     <<gps_cog>>
 #+end_src
 
-This conversion is valid assuming that the robot never travels more than a few kilometers.
+The conversion has to use the WGS84 ellipsoid, the shape GPS fixes are given on. It used to treat the Earth as a sphere with the equatorial radius. At our latitude (38.65° N) that is off by the ellipsoid's curvature: on the real ellipsoid a degree of latitude is 0.28 % shorter than on that sphere, and a degree of longitude 0.13 % longer. So 100 m north came out as 100.28 m and 100 m east as 99.87 m. In the sim that was a steady ~0.25 m EKF error at the end of a 190 m route (TDM-25).
+
+We put the datum and the fix in Earth-centred, Earth-fixed (ECEF) coordinates on the ellipsoid and rotate their difference into east/north at the datum. The result is the datum's local tangent plane, the same model Gazebo's NavSat sensor uses (=washu.world= has =EARTH_WGS84= spherical coordinates). Projecting onto the plane shortens distances by less than a millimetre within 5 km. Height is ignored: a few metres of it move the horizontal position by less than 0.2 mm on campus. Over the planner's bounding box this agrees with pyproj's geodesics to within a micrometre. The old sphere was off by up to 28 cm per 100 m. In the sim, at rest at the end of the same 190 m route, the EKF is now 2 mm from ground truth instead of 0.25 m.
+
+The =odom= frame is therefore true east/north metres from the datum. The planner's =map= is the UTM zone 15N grid, which differs from it in two ways:
+- *Grid convergence*: 1.685° here. =gps_datum_tf= in delivery-robo puts it in the yaw of map→odom.
+- *UTM point scale*: 1.00028 here (0.9996 at the central meridian, 93° W). A point 100 m from the datum is 100.028 m away in =map=, so 2.8 cm per 100 m are left over after the rigid map→odom. No rigid transform can absorb a scale.
+
+The convergence also changes by 0.002° across the campus (about 1 cm over 300 m), which is likewise left over.
 
 #+begin_src python :tangle ../src/autonomy/autonomy/utils/latlon2meters.py
 import math
 
-EARTH_RADIUS = 6378137.0
+# WGS84, the ellipsoid GPS fixes (and Gazebo's NavSat sensor) use
+WGS84_A = 6378137.0                   # semi-major axis [m]
+WGS84_F = 1.0 / 298.257223563         # flattening
+WGS84_E2 = WGS84_F * (2.0 - WGS84_F)  # first eccentricity squared
+
+def geodetic_to_ecef(lat_rad, lon_rad):
+    """ECEF position [m] of a point on the WGS84 ellipsoid (height 0)."""
+    sin_lat = math.sin(lat_rad)
+    cos_lat = math.cos(lat_rad)
+    n = WGS84_A / math.sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat)  # prime-vertical radius of curvature
+    return (n * cos_lat * math.cos(lon_rad),
+            n * cos_lat * math.sin(lon_rad),
+            n * (1.0 - WGS84_E2) * sin_lat)
 
 def latlon2meters(lon_rad, lat_rad, origin_lon, origin_lat):
-    x = EARTH_RADIUS * (lon_rad - origin_lon) * math.cos(origin_lat)
-    y = EARTH_RADIUS * (lat_rad - origin_lat)
+    """East (x) and north (y) [m] of a fix from the origin, in the origin's local tangent plane."""
+    x0, y0, z0 = geodetic_to_ecef(origin_lat, origin_lon)
+    x1, y1, z1 = geodetic_to_ecef(lat_rad, lon_rad)
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+
+    sin_lat, cos_lat = math.sin(origin_lat), math.cos(origin_lat)
+    sin_lon, cos_lon = math.sin(origin_lon), math.cos(origin_lon)
+    x = -sin_lon * dx + cos_lon * dy
+    y = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
 
     return x, y
+#+end_src
+
+The test compares against WGS84 geodesics, which pyproj computes with GeographicLib: east = s·sin(azimuth), north = s·cos(azimuth). The contract is less than 1 cm of error per 100 m. With pyproj installed (the nix shell has it, and it is in delivery-robo's requirements) it sweeps the planner's bounding box from six datums. The fixed points below were computed the same way from Gazebo's world origin, so the test still checks something where pyproj is missing (e.g. the robot's system Python). Run it with =python -m pytest src/autonomy/test=.
+
+#+begin_src python :tangle ../src/autonomy/test/test_latlon2meters.py :mkdirp yes
+import math
+
+import pytest
+
+from autonomy.utils.latlon2meters import latlon2meters
+
+# global_planner's bounding box, and Gazebo's world origin (washu.world)
+LAT_MIN, LAT_MAX = 38.6473, 38.6490
+LON_MIN, LON_MAX = -90.3041, -90.3013
+GZ_ORIGIN = (38.64817527, -90.30128152)
+
+MAX_ERROR_PER_METRE = 1e-4  # 1 cm per 100 m
+
+# (lat, lon, east, north) from GZ_ORIGIN along the WGS84 geodesic (pyproj.Geod.inv, GeographicLib)
+REFERENCE = [
+    (38.64730000, -90.30410000, -245.362276, -97.158876),
+    (38.64900000, -90.30130000, -1.608735, 91.552275),
+    (38.64730000, -90.30130000, -1.608773, -97.162645),
+    (38.64900000, -90.30410000, -245.356479, 91.556044),
+    (38.64817527, -90.30410000, -245.359291, 0.003769),
+    (38.64900000, -90.30128152, 0.000000, 91.552275),
+    (38.64810000, -90.30270000, -123.484152, -8.354676),
+]
+
+
+def east_north(lat_deg, lon_deg, origin):
+    return latlon2meters(math.radians(lon_deg), math.radians(lat_deg),
+                         math.radians(origin[1]), math.radians(origin[0]))
+
+
+def test_datum_maps_to_zero():
+    assert east_north(*GZ_ORIGIN, GZ_ORIGIN) == (0.0, 0.0)
+
+
+def test_matches_reference_geodesics():
+    for lat, lon, ref_e, ref_n in REFERENCE:
+        e, n = east_north(lat, lon, GZ_ORIGIN)
+        err = math.hypot(e - ref_e, n - ref_n)
+        assert err < MAX_ERROR_PER_METRE * math.hypot(ref_e, ref_n), (lat, lon, e, n, err)
+
+
+def test_matches_pyproj_over_planner_bbox():
+    pyproj = pytest.importorskip('pyproj')
+    geod = pyproj.Geod(ellps='WGS84')
+    centre = ((LAT_MIN + LAT_MAX) / 2, (LON_MIN + LON_MAX) / 2)
+    corners = [(lat, lon) for lat in (LAT_MIN, LAT_MAX) for lon in (LON_MIN, LON_MAX)]
+    steps = 20
+    worst = 0.0
+    for origin in [GZ_ORIGIN, centre] + corners:
+        for i in range(steps + 1):
+            for j in range(steps + 1):
+                lat = LAT_MIN + (LAT_MAX - LAT_MIN) * i / steps
+                lon = LON_MIN + (LON_MAX - LON_MIN) * j / steps
+                az, _, s = geod.inv(origin[1], origin[0], lon, lat)
+                e, n = east_north(lat, lon, origin)
+                err = math.hypot(e - s * math.sin(math.radians(az)), n - s * math.cos(math.radians(az)))
+                worst = max(worst, err / max(s, 1.0))
+    assert worst < MAX_ERROR_PER_METRE, worst
 #+end_src
 
 
