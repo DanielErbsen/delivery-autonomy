@@ -1218,8 +1218,8 @@ from autonomy.utils.reference_trajectory import process_path, get_local_referenc
 from autonomy.utils.mppi_step import charged_steps, crop_window, free_window, mppi_step
 from autonomy.utils.dynamics import VEHICLE_PARAMS, Vehicle, dynamics_model, vehicle_param_problem
 from autonomy.utils.costmap_speed import (
-    GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
-    speed_limit)
+    GOVERNOR_PARAMS, OBSTACLE_MEMORY, Costmap, end_taper_speed, governor_param_problem, path_ahead,
+    path_progress, remembered_costmap, speed_limit)
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
@@ -1385,7 +1385,7 @@ def process_state_callback(self, odom_msg: Odometry):
     self.current_state = np.array([x, y, theta, v, omega, b_omega])
 #+end_src
 
-The controller also reads Nav2's costmap, to slow down and stop for obstacles near the path (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]). planner_server publishes it latched (reliable, transient local, depth 1), so the subscription asks for the same and gets the latest grid as soon as it connects. The callback only keeps the grid and the time it arrived. Age is measured on arrival, by this node's clock, because the grid's own stamp says when it was sent, not how fresh its contents are.
+The controller also reads Nav2's costmap, to slow down and stop for obstacles near the path (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]). planner_server publishes it latched (reliable, transient local, depth 1), so the subscription asks for the same and gets the latest grid as soon as it connects. The callback keeps the grid and the time it arrived, plus the grids of the last =OBSTACLE_MEMORY= seconds merged into one for the speed limit. Age is measured on arrival, by this node's clock, because the grid's own stamp says when it was sent, not how fresh its contents are.
 
 #+name: costmap_sub
 #+begin_src python
@@ -1394,6 +1394,8 @@ costmap_topic = self.get_parameter("costmap_topic").value
 
 self.costmap = None
 self.costmap_arrival = None
+self._recent_costmaps = []
+self.costmap_remembered = None
 self.costmap_subscription = self.create_subscription(
     OccupancyGrid,
     costmap_topic,
@@ -1407,8 +1409,15 @@ self.costmap_subscription = self.create_subscription(
 #+name: costmap_callback
 #+begin_src python
 def process_costmap_callback(self, msg: OccupancyGrid):
-    self.costmap = Costmap.from_msg(msg)
-    self.costmap_arrival = self.get_clock().now()
+    costmap = Costmap.from_msg(msg)
+    arrival = self.get_clock().now()
+    # The speed limit goes by every obstacle cell of the last OBSTACLE_MEMORY seconds
+    recent = [(t, c) for t, c in self._recent_costmaps
+              if 0.0 <= (arrival - t).nanoseconds * 1e-9 <= OBSTACLE_MEMORY]
+    recent.append((arrival, costmap))
+    self._recent_costmaps = recent
+    self.costmap_remembered = remembered_costmap([c for _, c in recent])
+    self.costmap, self.costmap_arrival = costmap, arrival
 #+end_src
 
 ** Parameters
@@ -1762,11 +1771,15 @@ MPPI only tracks the path. It knows nothing about obstacles. Nav2's local planne
 
 The obstacles are cells of 99 (inscribed) and 100 (lethal). Nav2 marks a cell 99 when a robot centred there would have its footprint's inscribed circle (radius 0.32 m) touching an obstacle. The distance from the robot's centre to the nearest such cell is then about the gap between the side of the footprint and the obstacle. At the front the real gap is ~0.08 m less, at a corner up to 0.19 m less. That way the costmap brings the footprint along, and the controller needs no copy of it. Distances are measured to the nearest edge of a cell, not its centre, because a centre anywhere in the cell collides. On a 0.1 m grid that keeps the measured gap from coming out larger than the real one, which matters in a gap only a little wider than the robot.
 
-Not every such cell counts. In a 3 m corridor the walls are always about 1.2 m from the robot, closer than =slow_distance=, so measuring to them would keep the robot at half speed for good. The cells that count are the ones the path ahead (the next =clearance_lookahead= metres) passes within =stop_distance= of, and only if following the path brings the robot closer to them. The clearance is the distance from the robot to the nearest of these. The speed limit is =max_speed= beyond =slow_distance=, then falls linearly towards zero at =stop_distance=, but never below =obstacle_creep_speed=. At =stop_distance= and inside it, it is zero. At zero the controller sends zero and keeps the goal open. It drives on once the costmap clears, or once local_planner sends a path that keeps =stop_distance=. The "closer" condition stops the robot from locking itself in place. Something beside or behind the robot that the path leads away from does not count, even inside =stop_distance=.
+Not every such cell counts. In a 3 m corridor the walls are always about 1.2 m from the robot, closer than =slow_distance=, so measuring to them would keep the robot at half speed for good. The cells that count are the ones the path ahead (the next =clearance_lookahead= metres) passes within =stop_distance= of, and only if following the path brings the robot closer to them. The clearance is the distance from the robot to the nearest of these. The speed limit is =max_speed= beyond =slow_distance=, then falls linearly towards zero at =stop_distance=, but never below =obstacle_creep_speed=. At =stop_distance= and inside it, it is zero. At zero the controller sends zero and keeps the goal open. It drives on once the costmap clears, or once local_planner sends a path that keeps =stop_distance=. The "closer" condition stops the robot from locking itself in place. Something behind the robot that the path leads away from does not count.
+
+Inside =stop_distance= the rule is stricter (TDM-42): there the robot may only move away. The path has to have it at least =CLOSER_BY= further from the nearest cell =ESCAPE_DISTANCE= (0.3 m) along, and never closer on the way. Otherwise the clearance is the robot's own distance to that cell, and the limit is zero. A path that does lead out allows =obstacle_creep_speed= at most. Before this rule, a path running beside a box counted for nothing: it brought the robot no closer to the cells level with it, and the cells further along were beyond =stop_distance=. In 4 of TDM-40's 6 runs the robot crept along a box that way, 0.17-0.19 m from it. 0.3 m is where a turn of radius 1.0 m that starts parallel to the obstacle has taken the robot 0.045 m away from it.
+
+The speed limit goes by every obstacle cell in the last =OBSTACLE_MEMORY= (1 s) of costmaps, not only the latest. The cells at a box's corner came and went between updates as the lidar's hits and the EKF pose jittered. In one TDM-42 run the robot's clearance read 0.19, 0.26, 0.17, 0.22 and 0.14 m in successive costmaps while it stood or crept beside the box. Every update without those cells let it creep a few centimetres closer, to 0.170 m by ground truth. The grids are combined cell by cell, and the highest value wins. Nav2's rolling window moves in whole cells, so they line up by shifting. A cleared obstacle holds the robot up to a second longer. MPPI's obstacle cost still uses the latest costmap.
 
 The floor is there because a speed proportional to the distance left never gets the robot to =stop_distance=. In the sim it inched along at 0.01 m/s and never counted as stopped. The first fix counted any limit under 0.05 m/s as a stop, but that moved the stop line out. With the robot's values (=max_speed= 1.0, =stop_distance= 0.2) the ramp passes 0.05 m/s at 0.2 + 0.05 × 1.8 / 1.0 = 0.29 m. Smac's path through the gap beside a box centred in a 3 m corridor runs about 0.2 m from the box's inscribed band, so the robot stopped there in 3 of 4 runs (TDM-34). With the floor it keeps moving, at a speed the drive can track, until it is at =stop_distance=. From 0.15 m/s it rolls only a few centimetres after the zero command.
 
-The robot therefore never drives through a gap narrower than its width plus twice =stop_distance= (0.63 + 0.7 m with the defaults). It waits in front of it instead. A box in the middle of a 3 m corridor leaves two 1.2 m gaps, so the robot stops there. Squeezing past would leave at most 0.27 m on each side.
+The robot therefore never drives through a gap narrower than its width plus twice =stop_distance= (0.63 + 0.7 m with the defaults). It waits in front of it instead. A box in the middle of a 3 m corridor leaves two 1.2 m gaps, so the robot stops there. Squeezing past would leave at most 0.27 m on each side. With the robot's 0.2 m that is 0.07 m to spare on each side, and less than the costmap's own noise. Against ground truth (TDM-42, seven runs, robot within 0.45 m of the box) the distance to the nearest inscribed cell's edge came out 0.02-0.07 m short of the footprint's real clearance, as a median per run. In single updates it ranged from 0.11 m short to 0.17 m over. It comes out over when a corner of the footprint swings in on a turn, which the centre does not see.
 
 Measured in the sim (TDM-32, TDM-25's route with a 0.6 m box, ground truth):
 - No box: not slowed once in 190 m.
@@ -1778,6 +1791,11 @@ The check takes under 0.2 ms a tick.
 Measured again with the floor (TDM-40, same route and box, the robot's values: =max_speed= 1.0, =min_speed= 0, =stop_distance= 0.2):
 - Box in the middle, 6 runs: creeps at 0.15 m/s from about 0.4 m and stops where it measures 0.19-0.20 m (0.18-0.26 m by ground truth). In 4 runs a new path then ran beside the box rather than towards it, so the box no longer counted, and the robot crept on (1 cm to 0.44 m) until the next path stopped it again. It came to rest 0.178-0.195 m from the box. With the 0.05 m/s cut-off it stopped 0.21-0.26 m away (TDM-34). It never touched the box and never got through. Once the robot is that close, local_planner's paths from where it stands pass the box 0.08-0.16 m from its inscribed band, so none of them keeps =stop_distance=.
 - No box: not slowed once. Box 0.45 m off-centre: passes 0.46 m away without slowing.
+
+Measured with the rule inside =stop_distance= and the 1 s memory (TDM-42, same route, box and values; local_planner's paths are no longer smoothed, see delivery-robo =nav2_local.yaml=):
+- Box in the middle, 8 runs, no contact. 3 passed, all through the south gap, 0.189-0.215 m from the box at the closest. Each time that was on the turn back behind it, where the rear corner swings in and the centre's distance does not show it. 5 stopped, all at the north gap, 0.196-0.209 m from the box, and drove on once it was removed. The box stands 5° askew to the corridor. On the north side its widest point is the near corner, so a robot still swinging out runs into the stop line there. On the south side the widest point is the far corner, which leaves more room to get out in time.
+- Without the memory (4 runs) one robot crept from 0.186 m to 0.170 m while the corner's cells flickered. With it the closest stop was 0.196 m.
+- No box: not slowed once, mean 0.99 m/s. Box 0.45 m off-centre: passes 0.47 m away without slowing.
 
 Without a usable costmap the speed is capped at =crawl_speed=: none has arrived yet, the last one is older than =costmap_timeout=, or it is in a frame the controller cannot place. A stale costmap still stops the robot for what it shows. The path and the robot state are in map, while Nav2's costmap is in odom (=nav2_local.yaml=). The points are moved into the costmap's frame with the cached map->odom. A costmap in map is used as it is.
 
@@ -1812,6 +1830,13 @@ PATH_STEP = 0.1
 # How much closer (m) the path has to bring the robot to a cell for that cell to count
 CLOSER_BY = 0.01
 
+# Within stop_distance already, the path must have the robot at least CLOSER_BY further from the
+# nearest cell this far (m) along it, or the robot stops
+ESCAPE_DISTANCE = 0.3
+
+# s: an obstacle cell in any costmap this recent still counts
+OBSTACLE_MEMORY = 1.0
+
 
 class Costmap(NamedTuple):
     cells: np.ndarray   # (height, width) int8; row = y, column = x
@@ -1826,6 +1851,28 @@ class Costmap(NamedTuple):
         cells = np.asarray(msg.data, dtype=np.int8).reshape(info.height, info.width)
         return cls(cells, info.resolution, (info.origin.position.x, info.origin.position.y),
                    msg.header.frame_id)
+
+
+def remembered_costmap(costmaps):
+    """The newest of `costmaps` (oldest first), each cell raised to the highest value any of them
+    holds there. Nav2's rolling window moves in whole cells, so the grids line up by shifting.
+    Grids in another frame or at another resolution are skipped."""
+    newest = costmaps[-1]
+    cells = newest.cells.copy()
+    height, width = cells.shape
+    res = newest.resolution
+    for old in costmaps[:-1]:
+        if old.frame != newest.frame or old.resolution != res:
+            continue
+        # old cell [r, c] is newest cell [r + dr, c + dc]
+        dc = round((old.origin[0] - newest.origin[0]) / res)
+        dr = round((old.origin[1] - newest.origin[1]) / res)
+        r0, r1 = max(dr, 0), min(dr + old.cells.shape[0], height)
+        c0, c1 = max(dc, 0), min(dc + old.cells.shape[1], width)
+        if r0 < r1 and c0 < c1:
+            np.maximum(cells[r0:r1, c0:c1], old.cells[r0 - dr:r1 - dr, c0 - dc:c1 - dc],
+                       out=cells[r0:r1, c0:c1])
+    return newest._replace(cells=cells)
 
 
 def governor_param_problem(use_costmap, slow_distance, stop_distance, obstacle_creep_speed,
@@ -1901,31 +1948,53 @@ def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
     return np.vstack((position, ahead))
 
 
-def obstacle_clearance(costmap, points, stop_distance):
-    """Distance from points[0] (the robot) to the nearest inscribed or lethal cell that the path
-    points[1:] passes within stop_distance of and brings the robot closer to. All in the
-    costmap's frame. inf when there is none."""
+def cell_distances(costmap, points, reach):
+    """(cells, points) distances from each point to the nearest edge of every inscribed or lethal
+    cell within `reach` of some point, or None when there is none. All in the costmap's frame."""
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
     res = costmap.resolution
     ox, oy = costmap.origin
     height, width = costmap.cells.shape
-    # Only cells within stop_distance of a path point can count
-    lo = points.min(axis=0) - stop_distance
-    hi = points.max(axis=0) + stop_distance
+    lo = points.min(axis=0) - reach
+    hi = points.max(axis=0) + reach
     c0, c1 = max(int((lo[0] - ox) // res), 0), min(int((hi[0] - ox) // res) + 1, width)
     r0, r1 = max(int((lo[1] - oy) // res), 0), min(int((hi[1] - oy) // res) + 1, height)
     if c0 >= c1 or r0 >= r1:
-        return math.inf
+        return None
     rows, cols = np.nonzero(costmap.cells[r0:r1, c0:c1] >= INSCRIBED)
     if rows.size == 0:
-        return math.inf
+        return None
     centres = np.column_stack((ox + (cols + c0 + 0.5) * res, oy + (rows + r0 + 0.5) * res))
-    # To the nearest point of each cell, not its centre: (cells, points)
+    # To the nearest point of each cell, not its centre
     gap = np.maximum(np.abs(centres[:, None, :] - points[None, :, :]) - res / 2, 0.0)
-    dist = np.hypot(gap[..., 0], gap[..., 1])
+    return np.hypot(gap[..., 0], gap[..., 1])
+
+
+def obstacle_clearance(costmap, points, stop_distance):
+    """Distance from points[0] (the robot) to the nearest inscribed or lethal cell that the path
+    points[1:] passes within stop_distance of and brings the robot closer to. A robot within
+    stop_distance of a cell already gets its distance to the nearest cell, unless the path leads
+    straight out. All in the costmap's frame. inf when no cell counts."""
+    # Only cells within stop_distance of a point can count (+ CLOSER_BY for the way out)
+    dist = cell_distances(costmap, points, stop_distance + CLOSER_BY)
+    if dist is None:
+        return math.inf
     now = dist[:, 0]
     ahead = dist[:, 1:].min(axis=1) if len(points) > 1 else now
+    clearance = float(now.min())
+    if clearance <= stop_distance:
+        # Out means further from every cell ESCAPE_DISTANCE along, and never closer on the way
+        escape = dist[:, min(1 + round(ESCAPE_DISTANCE / PATH_STEP), len(points) - 1)].min()
+        out = escape >= clearance + CLOSER_BY and ahead.min() >= clearance - CLOSER_BY
+        return math.inf if out else clearance
     counts = (ahead < stop_distance) & (ahead < now - CLOSER_BY)
     return float(now[counts].min()) if counts.any() else math.inf
+
+
+def robot_clearance(costmap, position, reach):
+    """Distance from `position` to the nearest inscribed or lethal cell, inf beyond `reach`."""
+    dist = cell_distances(costmap, position, reach)
+    return math.inf if dist is None else float(dist.min())
 
 
 def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, stop_distance,
@@ -1941,14 +2010,18 @@ def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, st
         return crawl, None, 'missing'
     if costmap_pose is None:
         return crawl, None, 'unplaced'
-    clearance = obstacle_clearance(costmap, to_frame(points, costmap_pose), stop_distance)
+    points = to_frame(points, costmap_pose)
+    clearance = obstacle_clearance(costmap, points, stop_distance)
     limit = speed_for_clearance(clearance, max_speed, slow_distance, stop_distance, creep_speed)
+    if limit > 0.0 and robot_clearance(costmap, points[0], stop_distance) <= stop_distance:
+        # Inside stop_distance and the path leads out: no faster than the creep
+        limit = min(limit, creep_speed)
     if age > costmap_timeout:
         return min(limit, crawl), clearance, 'stale'
     return limit, clearance, 'stop' if limit <= 0.0 else 'slow' if limit < max_speed else 'clear'
 #+end_src
 
-The tests build small grids by hand: a 3 m corridor, a box on the path, a box beside it (=python -m pytest src/autonomy/test= with the workspace sourced).
+The tests build small grids by hand: a 3 m corridor, a box on the path, a box beside it, a robot already inside =stop_distance= of one, and a box that drops out of the next costmap update (=python -m pytest src/autonomy/test= with the workspace sourced).
 
 #+begin_src python :tangle ../src/autonomy/test/test_costmap_speed.py :mkdirp yes
 import math
@@ -1958,7 +2031,7 @@ import pytest
 
 from autonomy.utils.costmap_speed import (
     GOVERNOR_PARAMS, Costmap, governor_param_problem, obstacle_clearance, path_ahead,
-    speed_for_clearance, speed_limit, to_frame)
+    remembered_costmap, speed_for_clearance, speed_limit, to_frame)
 
 RES = 0.1
 LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, creep_speed=0.15,
@@ -2096,6 +2169,60 @@ def test_obstacle_the_path_leads_away_from_does_not_lock_the_robot():
     assert obstacle_clearance(costmap, ahead_tdm32(4.0), 0.35) <= 0.35
 
 
+def path_tdm42(xy):
+    xy = np.asarray(xy, dtype=float)
+    return xy, np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))))
+
+
+def beside_box_tdm42():
+    """TDM-40's creep: the robot stopped beside a box, 0.17 m from its inscribed band (box at
+    (6.0, 0.7), band from x 5.40 and y 0.10, robot at (5.8, -0.07) heading +x)."""
+    return add_box_tdm32(corridor_tdm32(), 6.0, 0.7), (5.8, -0.07)
+
+
+def test_parallel_path_inside_stop_distance_stops_the_robot():
+    """TDM-40: a path along the box brought the robot no closer to the cells beside it, and the
+    cells further along were beyond stop_distance, so the robot crept on at 0.15 m/s."""
+    costmap, (x, y) = beside_box_tdm42()
+    path = path_tdm42([(x0, y) for x0 in np.arange(5.0, 12.0, 0.1)])
+    pts = path_ahead((x, y), *path, 0, 3.0)
+    assert obstacle_clearance(costmap, pts, 0.2) == pytest.approx(0.17, abs=1e-6)
+    limit, clearance, status = speed_limit(costmap, 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)
+    assert (limit, status) == (0.0, 'stop')
+    # the same path with the box gone: full speed again
+    limit, clearance, status = speed_limit(corridor_tdm32(), 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)
+    assert (limit, clearance, status) == (1.0, math.inf, 'clear')
+
+
+def test_path_leading_away_inside_stop_distance_creeps_out():
+    costmap, (x, y) = beside_box_tdm42()
+    # a 1.0 m radius turn away from the box: 0.045 m further from it after 0.3 m
+    theta = np.arange(0.0, 1.5, 0.05)
+    path = path_tdm42(np.column_stack((x + np.sin(theta), y - (1.0 - np.cos(theta)))))
+    pts = path_ahead((x, y), *path, 0, 3.0)
+    assert obstacle_clearance(costmap, pts, 0.2) == math.inf
+    limit, clearance, status = speed_limit(costmap, 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)
+    assert (limit, status) == (0.15, 'slow')
+    # turning towards the box instead stops it
+    path = path_tdm42(np.column_stack((x + np.sin(theta), y + (1.0 - np.cos(theta)))))
+    pts = path_ahead((x, y), *path, 0, 3.0)
+    assert speed_limit(costmap, 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)[0] == 0.0
+
+
+def test_remembered_costmap_keeps_the_obstacles_of_recent_updates():
+    """TDM-42: in the sim a box corner's cells came and went between costmap updates, and every
+    update without them let the robot creep a few centimetres closer."""
+    seen = add_box_tdm32(corridor_tdm32(), 6.0, 0.7)
+    # the next update has rolled 1.0 m on and 0.2 m up, and lost the box
+    gone = Costmap(np.zeros((100, 200), dtype=np.int8), RES, (-4.0, -4.8), 'odom')
+    merged = remembered_costmap([seen, gone])
+    assert merged.origin == gone.origin and merged.cells.shape == gone.cells.shape
+    row, col = round((0.7 + 4.8) / RES), round((6.0 + 4.0) / RES)
+    assert merged.cells[row, col] == 100 and gone.cells[row, col] == 0
+    # a grid in another frame is left out
+    assert remembered_costmap([seen._replace(frame='map'), gone]).cells.max() == 0
+
+
 def test_map_to_odom_is_applied():
     # costmap in odom; odom sits at (100, 50) in map, rotated 90 deg
     costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
@@ -2164,7 +2291,7 @@ def costmap_speed_limit(self, state, path_xy, path_s):
                         self._odom_frame: self._map_to_odom}.get(self.costmap.frame)
     points = path_ahead(state, path_xy, path_s, self.progress_idx, self.clearance_lookahead)
     limit, clearance, status = speed_limit(
-        self.costmap, age, points, costmap_pose, self.max_speed, self.slow_distance,
+        self.costmap_remembered, age, points, costmap_pose, self.max_speed, self.slow_distance,
         self.stop_distance, self.obstacle_creep_speed, self.costmap_timeout, self.crawl_speed)
 
     if status in ('missing', 'unplaced', 'stale'):

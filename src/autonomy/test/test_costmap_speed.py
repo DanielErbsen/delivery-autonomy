@@ -5,7 +5,7 @@ import pytest
 
 from autonomy.utils.costmap_speed import (
     GOVERNOR_PARAMS, Costmap, governor_param_problem, obstacle_clearance, path_ahead,
-    speed_for_clearance, speed_limit, to_frame)
+    remembered_costmap, speed_for_clearance, speed_limit, to_frame)
 
 RES = 0.1
 LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, creep_speed=0.15,
@@ -141,6 +141,60 @@ def test_obstacle_the_path_leads_away_from_does_not_lock_the_robot():
     assert obstacle_clearance(costmap, ahead_tdm32(5.3), 0.35) == math.inf
     # level with its start, the same box stops the robot
     assert obstacle_clearance(costmap, ahead_tdm32(4.0), 0.35) <= 0.35
+
+
+def path_tdm42(xy):
+    xy = np.asarray(xy, dtype=float)
+    return xy, np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))))
+
+
+def beside_box_tdm42():
+    """TDM-40's creep: the robot stopped beside a box, 0.17 m from its inscribed band (box at
+    (6.0, 0.7), band from x 5.40 and y 0.10, robot at (5.8, -0.07) heading +x)."""
+    return add_box_tdm32(corridor_tdm32(), 6.0, 0.7), (5.8, -0.07)
+
+
+def test_parallel_path_inside_stop_distance_stops_the_robot():
+    """TDM-40: a path along the box brought the robot no closer to the cells beside it, and the
+    cells further along were beyond stop_distance, so the robot crept on at 0.15 m/s."""
+    costmap, (x, y) = beside_box_tdm42()
+    path = path_tdm42([(x0, y) for x0 in np.arange(5.0, 12.0, 0.1)])
+    pts = path_ahead((x, y), *path, 0, 3.0)
+    assert obstacle_clearance(costmap, pts, 0.2) == pytest.approx(0.17, abs=1e-6)
+    limit, clearance, status = speed_limit(costmap, 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)
+    assert (limit, status) == (0.0, 'stop')
+    # the same path with the box gone: full speed again
+    limit, clearance, status = speed_limit(corridor_tdm32(), 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)
+    assert (limit, clearance, status) == (1.0, math.inf, 'clear')
+
+
+def test_path_leading_away_inside_stop_distance_creeps_out():
+    costmap, (x, y) = beside_box_tdm42()
+    # a 1.0 m radius turn away from the box: 0.045 m further from it after 0.3 m
+    theta = np.arange(0.0, 1.5, 0.05)
+    path = path_tdm42(np.column_stack((x + np.sin(theta), y - (1.0 - np.cos(theta)))))
+    pts = path_ahead((x, y), *path, 0, 3.0)
+    assert obstacle_clearance(costmap, pts, 0.2) == math.inf
+    limit, clearance, status = speed_limit(costmap, 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)
+    assert (limit, status) == (0.15, 'slow')
+    # turning towards the box instead stops it
+    path = path_tdm42(np.column_stack((x + np.sin(theta), y + (1.0 - np.cos(theta)))))
+    pts = path_ahead((x, y), *path, 0, 3.0)
+    assert speed_limit(costmap, 0.1, pts, (0.0, 0.0, 0.0), **ROBOT)[0] == 0.0
+
+
+def test_remembered_costmap_keeps_the_obstacles_of_recent_updates():
+    """TDM-42: in the sim a box corner's cells came and went between costmap updates, and every
+    update without them let the robot creep a few centimetres closer."""
+    seen = add_box_tdm32(corridor_tdm32(), 6.0, 0.7)
+    # the next update has rolled 1.0 m on and 0.2 m up, and lost the box
+    gone = Costmap(np.zeros((100, 200), dtype=np.int8), RES, (-4.0, -4.8), 'odom')
+    merged = remembered_costmap([seen, gone])
+    assert merged.origin == gone.origin and merged.cells.shape == gone.cells.shape
+    row, col = round((0.7 + 4.8) / RES), round((6.0 + 4.0) / RES)
+    assert merged.cells[row, col] == 100 and gone.cells[row, col] == 0
+    # a grid in another frame is left out
+    assert remembered_costmap([seen._replace(frame='map'), gone]).cells.max() == 0
 
 
 def test_map_to_odom_is_applied():
