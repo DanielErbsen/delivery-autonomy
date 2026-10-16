@@ -8,7 +8,10 @@ from autonomy.utils.costmap_speed import (
     speed_for_clearance, speed_limit, to_frame)
 
 RES = 0.1
-LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, costmap_timeout=1.0, crawl_speed=0.3)
+LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, creep_speed=0.15,
+              costmap_timeout=1.0, crawl_speed=0.3)
+# delivery-robo's hardware.yaml (TDM-34)
+ROBOT = {**LIMITS, 'max_speed': 1.0, 'stop_distance': 0.2}
 
 
 def corridor_tdm32(half_width=1.5, inscribed=0.32, length=20.0):
@@ -47,11 +50,37 @@ def ahead_tdm32(x, path=None, y=0.0):
 
 
 def test_ramp():
-    assert speed_for_clearance(math.inf, 1.5, 2.0, 0.35) == 1.5
-    assert speed_for_clearance(2.0, 1.5, 2.0, 0.35) == 1.5
-    assert speed_for_clearance(0.35, 1.5, 2.0, 0.35) == 0.0
-    assert speed_for_clearance(0.1, 1.5, 2.0, 0.35) == 0.0
-    assert speed_for_clearance(1.175, 1.5, 2.0, 0.35) == pytest.approx(0.75)
+    assert speed_for_clearance(math.inf, 1.5, 2.0, 0.35, 0.15) == 1.5
+    assert speed_for_clearance(2.0, 1.5, 2.0, 0.35, 0.15) == 1.5
+    assert speed_for_clearance(0.35, 1.5, 2.0, 0.35, 0.15) == 0.0
+    assert speed_for_clearance(0.1, 1.5, 2.0, 0.35, 0.15) == 0.0
+    assert speed_for_clearance(1.175, 1.5, 2.0, 0.35, 0.15) == pytest.approx(0.75)
+    # the ramp gives 0.15 m/s at 0.515 m; from there to stop_distance it is the floor
+    assert speed_for_clearance(0.6, 1.5, 2.0, 0.35, 0.15) == pytest.approx(1.5 * 0.25 / 1.65)
+    assert speed_for_clearance(0.5, 1.5, 2.0, 0.35, 0.15) == 0.15
+    assert speed_for_clearance(0.36, 1.5, 2.0, 0.35, 0.15) == 0.15
+    # never above max_speed, even with a floor above it
+    assert speed_for_clearance(0.36, 0.1, 2.0, 0.35, 0.15) == 0.1
+
+
+def test_robot_values_stop_at_stop_distance_not_before():
+    """TDM-40: with hardware.yaml's values the old 0.05 m/s cut-off stopped the robot at 0.29 m."""
+    ramp = lambda c: speed_for_clearance(c, 1.0, 2.0, 0.2, 0.15)  # noqa: E731
+    assert ramp(0.2) == 0.0
+    assert ramp(0.19) == 0.0
+    assert ramp(0.2 + 1e-9) == 0.15
+    for clearance in (0.21, 0.25, 0.29, 0.4, 0.47):
+        assert ramp(clearance) == 0.15, clearance
+    assert ramp(1.1) == pytest.approx(0.5)
+    # the same through speed_limit, robot in front of a box on the path (band edge at x 5.40)
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
+    for x, clearance in ((5.11, 0.29), (5.19, 0.21)):
+        limit, c, status = speed_limit(costmap, 0.1, ahead_tdm32(x), (0.0, 0.0, 0.0), **ROBOT)
+        assert c == pytest.approx(clearance, abs=1e-6)
+        assert (limit, status) == (0.15, 'slow'), x
+    limit, c, status = speed_limit(costmap, 0.1, ahead_tdm32(5.21), (0.0, 0.0, 0.0), **ROBOT)
+    assert c == pytest.approx(0.19, abs=1e-6)
+    assert (limit, status) == (0.0, 'stop')
 
 
 def test_path_ahead_starts_at_the_robot_and_runs_lookahead_along_the_path():
@@ -83,10 +112,10 @@ def test_box_on_the_path_slows_then_stops_the_robot():
     near = speed_limit(costmap, 0.1, ahead_tdm32(5.1), (0.0, 0.0, 0.0), **LIMITS)
     assert near[1] == pytest.approx(0.3, abs=1e-6)
     assert near[0] == 0.0 and near[2] == 'stop'
-    # 0.38 m would still allow 0.027 m/s: too slow to be worth driving, so a stop
+    # at 0.38 m the ramp would allow 0.027 m/s; the floor keeps it moving to stop_distance
     creep = speed_limit(costmap, 0.1, ahead_tdm32(5.02), (0.0, 0.0, 0.0), **LIMITS)
     assert creep[1] == pytest.approx(0.38, abs=1e-6)
-    assert creep[0] == 0.0 and creep[2] == 'stop'
+    assert creep[0] == 0.15 and creep[2] == 'slow'
 
 
 def test_box_in_the_middle_of_a_3m_corridor_blocks_the_gap():
@@ -163,6 +192,7 @@ def test_costmap_from_occupancy_grid_message():
 def test_param_checks():
     assert governor_param_problem(**GOVERNOR_PARAMS) is None
     for name, value in [('slow_distance', 0.35), ('stop_distance', -0.1), ('clearance_lookahead', 0.0),
-                        ('costmap_timeout', 0.0), ('crawl_speed', -0.1)]:
+                        ('costmap_timeout', 0.0), ('crawl_speed', -0.1), ('obstacle_creep_speed', 0.0),
+                        ('obstacle_creep_speed', -0.1)]:
         assert governor_param_problem(**{**GOVERNOR_PARAMS, name: value}) is not None, (name, value)
     assert governor_param_problem(**{**GOVERNOR_PARAMS, 'crawl_speed': 0.0}) is None

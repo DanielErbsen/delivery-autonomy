@@ -1324,17 +1324,18 @@ Speed and goal tolerances are ROS parameters. Their defaults are the values this
 
 The obstacle speed limit (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]) and the braking for the end of the path have their own:
 
-| Parameter             | Default | Meaning                                                                          |
-|-----------------------+---------+----------------------------------------------------------------------------------|
-| =use_costmap=         | true    | Slow down and stop for obstacles in the costmap. false = ignore it altogether.   |
-| =slow_distance=       |     2.0 | m. Clearance below which the robot starts slowing down.                          |
-| =stop_distance=       |    0.35 | m. Clearance at which it stops (and waits, goal kept).                           |
-| =clearance_lookahead= |     3.0 | m. How much of the path ahead is checked.                                        |
-| =costmap_timeout=     |     1.0 | s. A costmap older than this, or none at all, caps the speed at =crawl_speed=.   |
-| =crawl_speed=         |     0.3 | m/s. The cap without a fresh costmap.                                            |
-| =goal_decel=          |     0.8 | m/s². How hard the robot plans to brake for the end of the path ([[*End of Path][End of Path]]).   |
-| =goal_creep_speed=    |    0.15 | m/s. The slowest the end-of-path taper ever asks for.                            |
-| =costmap_topic=       | =/global_costmap/costmap= | Read once at startup.                                    |
+| Parameter              | Default | Meaning                                                                          |
+|------------------------+---------+----------------------------------------------------------------------------------|
+| =use_costmap=          | true    | Slow down and stop for obstacles in the costmap. false = ignore it altogether.   |
+| =slow_distance=        |     2.0 | m. Clearance below which the robot starts slowing down.                          |
+| =stop_distance=        |    0.35 | m. Clearance at which it stops (and waits, goal kept).                           |
+| =obstacle_creep_speed= |    0.15 | m/s. The slowest the obstacle limit asks for short of =stop_distance=.           |
+| =clearance_lookahead=  |     3.0 | m. How much of the path ahead is checked.                                        |
+| =costmap_timeout=      |     1.0 | s. A costmap older than this, or none at all, caps the speed at =crawl_speed=.   |
+| =crawl_speed=          |     0.3 | m/s. The cap without a fresh costmap.                                            |
+| =goal_decel=           |     0.8 | m/s². How hard the robot plans to brake for the end of the path ([[*End of Path][End of Path]]).   |
+| =goal_creep_speed=     |    0.15 | m/s. The slowest the end-of-path taper ever asks for.                            |
+| =costmap_topic=        | =/global_costmap/costmap= | Read once at startup.                                    |
 
 With =use_costmap= true and no costmap at all (Nav2 not running), the robot only ever crawls. Set it to false to follow paths without Nav2.
 
@@ -1623,7 +1624,9 @@ MPPI only tracks the path. It knows nothing about obstacles. Nav2's local planne
 
 The obstacles are cells of 99 (inscribed) and 100 (lethal). Nav2 marks a cell 99 when a robot centred there would have its footprint's inscribed circle (radius 0.32 m) touching an obstacle. The distance from the robot's centre to the nearest such cell is then about the gap between the side of the footprint and the obstacle. At the front the real gap is ~0.08 m less, at a corner up to 0.19 m less. That way the costmap brings the footprint along, and the controller needs no copy of it. Distances are measured to the nearest edge of a cell, not its centre, because a centre anywhere in the cell collides. On a 0.1 m grid that keeps the measured gap from coming out larger than the real one, which matters in a gap only a little wider than the robot.
 
-Not every such cell counts. In a 3 m corridor the walls are always about 1.2 m from the robot, closer than =slow_distance=, so measuring to them would keep the robot at half speed for good. The cells that count are the ones the path ahead (the next =clearance_lookahead= metres) passes within =stop_distance= of, and only if following the path brings the robot closer to them. The clearance is the distance from the robot to the nearest of these. The speed limit is =max_speed= beyond =slow_distance=, then falls linearly to zero at =stop_distance=. A limit below 0.05 m/s counts as zero: with the speed proportional to the distance left, the robot only ever creeps up to =stop_distance=, and in the sim it inched along at 0.01 m/s without ever counting as stopped. At zero the controller sends zero and keeps the goal open. It drives on once the costmap clears, or once local_planner sends a path that keeps =stop_distance=. The "closer" condition stops the robot from locking itself in place. Something beside or behind the robot that the path leads away from does not count, even inside =stop_distance=.
+Not every such cell counts. In a 3 m corridor the walls are always about 1.2 m from the robot, closer than =slow_distance=, so measuring to them would keep the robot at half speed for good. The cells that count are the ones the path ahead (the next =clearance_lookahead= metres) passes within =stop_distance= of, and only if following the path brings the robot closer to them. The clearance is the distance from the robot to the nearest of these. The speed limit is =max_speed= beyond =slow_distance=, then falls linearly towards zero at =stop_distance=, but never below =obstacle_creep_speed=. At =stop_distance= and inside it, it is zero. At zero the controller sends zero and keeps the goal open. It drives on once the costmap clears, or once local_planner sends a path that keeps =stop_distance=. The "closer" condition stops the robot from locking itself in place. Something beside or behind the robot that the path leads away from does not count, even inside =stop_distance=.
+
+The floor is there because a speed proportional to the distance left never gets the robot to =stop_distance=. In the sim it inched along at 0.01 m/s and never counted as stopped. The first fix counted any limit under 0.05 m/s as a stop, but that moved the stop line out. With the robot's values (=max_speed= 1.0, =stop_distance= 0.2) the ramp passes 0.05 m/s at 0.2 + 0.05 × 1.8 / 1.0 = 0.29 m. Smac's path through the gap beside a box centred in a 3 m corridor runs about 0.2 m from the box's inscribed band, so the robot stopped there in 3 of 4 runs (TDM-34). With the floor it keeps moving, at a speed the drive can track, until it is at =stop_distance=. From 0.15 m/s it rolls only a few centimetres after the zero command.
 
 The robot therefore never drives through a gap narrower than its width plus twice =stop_distance= (0.63 + 0.7 m with the defaults). It waits in front of it instead. A box in the middle of a 3 m corridor leaves two 1.2 m gaps, so the robot stops there. Squeezing past would leave at most 0.27 m on each side.
 
@@ -1633,6 +1636,10 @@ Measured in the sim (TDM-32, TDM-25's route with a 0.6 m box, ground truth):
 - Box 0.45 m off-centre: slows to 0.64 m/s while the path still runs through the box's unseen side, then passes 0.49 m away. TDM-25 measured 0.36 m without the speed limit.
 - Box in the middle with =stop_distance= 0.2: squeezes through at 0.3-0.4 m/s, 0.24 m from the box, with three short stops in the gap.
 The check takes under 0.2 ms a tick.
+
+Measured again with the floor (TDM-40, same route and box, the robot's values: =max_speed= 1.0, =min_speed= 0, =stop_distance= 0.2):
+- Box in the middle, 6 runs: creeps at 0.15 m/s from about 0.4 m and stops where it measures 0.19-0.20 m (0.18-0.26 m by ground truth). In 4 runs a new path then ran beside the box rather than towards it, so the box no longer counted, and the robot crept on (1 cm to 0.44 m) until the next path stopped it again. It came to rest 0.178-0.195 m from the box. With the 0.05 m/s cut-off it stopped 0.21-0.26 m away (TDM-34). It never touched the box and never got through. Once the robot is that close, local_planner's paths from where it stands pass the box 0.08-0.16 m from its inscribed band, so none of them keeps =stop_distance=.
+- No box: not slowed once. Box 0.45 m off-centre: passes 0.46 m away without slowing.
 
 Without a usable costmap the speed is capped at =crawl_speed=: none has arrived yet, the last one is older than =costmap_timeout=, or it is in a frame the controller cannot place. A stale costmap still stops the robot for what it shows. The path and the robot state are in map, while Nav2's costmap is in odom (=nav2_local.yaml=). The points are moved into the costmap's frame with the cached map->odom. A costmap in map is used as it is.
 
@@ -1648,13 +1655,14 @@ import numpy as np
 # Defaults, under the names the controller declares them as parameters
 GOVERNOR_PARAMS = {
     'use_costmap': True,
-    'slow_distance': 2.0,         # m: full speed beyond this clearance
-    'stop_distance': 0.35,        # m: zero at or below it
-    'clearance_lookahead': 3.0,   # m of path checked
-    'costmap_timeout': 1.0,       # s: older than this counts as no costmap
-    'crawl_speed': 0.3,           # m/s: the cap without a usable costmap
-    'goal_decel': 0.8,            # m/s^2: braking for the end of the path (End of Path)
-    'goal_creep_speed': 0.15,     # m/s: the taper never goes below this
+    'slow_distance': 2.0,          # m: full speed beyond this clearance
+    'stop_distance': 0.35,         # m: zero at or below it
+    'obstacle_creep_speed': 0.15,  # m/s: the obstacle limit's floor short of stop_distance
+    'clearance_lookahead': 3.0,    # m of path checked
+    'costmap_timeout': 1.0,        # s: older than this counts as no costmap
+    'crawl_speed': 0.3,            # m/s: the cap without a usable costmap
+    'goal_decel': 0.8,             # m/s^2: braking for the end of the path (End of Path)
+    'goal_creep_speed': 0.15,      # m/s: the taper never goes below this
 }
 
 # Nav2's OccupancyGrid: 100 lethal, 99 inscribed, 1-98 inflation, 0 free, -1 unknown
@@ -1665,9 +1673,6 @@ PATH_STEP = 0.1
 
 # How much closer (m) the path has to bring the robot to a cell for that cell to count
 CLOSER_BY = 0.01
-
-# m/s. An obstacle limit below this is a stop
-MIN_SPEED = 0.05
 
 
 class Costmap(NamedTuple):
@@ -1685,9 +1690,13 @@ class Costmap(NamedTuple):
                    msg.header.frame_id)
 
 
-def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_lookahead,
-                           costmap_timeout, crawl_speed, goal_decel, goal_creep_speed):
+def governor_param_problem(use_costmap, slow_distance, stop_distance, obstacle_creep_speed,
+                           clearance_lookahead, costmap_timeout, crawl_speed, goal_decel,
+                           goal_creep_speed):
     """Return why these settings are unusable, or None when they are fine."""
+    if not obstacle_creep_speed > 0.0:
+        return (f'obstacle_creep_speed must be positive (or the robot never reaches stop_distance), '
+                f'got {obstacle_creep_speed}')
     if not goal_decel > 0.0:
         return f'goal_decel must be positive, got {goal_decel}'
     if not goal_creep_speed > 0.0:
@@ -1705,13 +1714,15 @@ def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_
     return None
 
 
-def speed_for_clearance(clearance, max_speed, slow_distance, stop_distance):
-    """max_speed beyond slow_distance, linearly down to 0 at stop_distance."""
+def speed_for_clearance(clearance, max_speed, slow_distance, stop_distance, creep_speed):
+    """max_speed beyond slow_distance, then linearly down towards 0 at stop_distance but never
+    below creep_speed (nor above max_speed); 0 at or below stop_distance."""
     if clearance <= stop_distance:
         return 0.0
     if clearance >= slow_distance:
         return float(max_speed)
-    return float(max_speed * (clearance - stop_distance) / (slow_distance - stop_distance))
+    ramp = max_speed * (clearance - stop_distance) / (slow_distance - stop_distance)
+    return float(min(max(ramp, creep_speed), max_speed))
 
 
 def to_frame(points, frame_pose):
@@ -1780,7 +1791,7 @@ def obstacle_clearance(costmap, points, stop_distance):
 
 
 def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, stop_distance,
-                costmap_timeout, crawl_speed):
+                creep_speed, costmap_timeout, crawl_speed):
     """The speed limit for a robot at points[0] about to follow points[1:] (map frame).
 
     costmap: a Costmap or None; age: s since it arrived; costmap_pose: its frame's pose in map
@@ -1793,9 +1804,7 @@ def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, st
     if costmap_pose is None:
         return crawl, None, 'unplaced'
     clearance = obstacle_clearance(costmap, to_frame(points, costmap_pose), stop_distance)
-    limit = speed_for_clearance(clearance, max_speed, slow_distance, stop_distance)
-    if limit < MIN_SPEED:
-        limit = 0.0
+    limit = speed_for_clearance(clearance, max_speed, slow_distance, stop_distance, creep_speed)
     if age > costmap_timeout:
         return min(limit, crawl), clearance, 'stale'
     return limit, clearance, 'stop' if limit <= 0.0 else 'slow' if limit < max_speed else 'clear'
@@ -1814,7 +1823,10 @@ from autonomy.utils.costmap_speed import (
     speed_for_clearance, speed_limit, to_frame)
 
 RES = 0.1
-LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, costmap_timeout=1.0, crawl_speed=0.3)
+LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, creep_speed=0.15,
+              costmap_timeout=1.0, crawl_speed=0.3)
+# delivery-robo's hardware.yaml (TDM-34)
+ROBOT = {**LIMITS, 'max_speed': 1.0, 'stop_distance': 0.2}
 
 
 def corridor_tdm32(half_width=1.5, inscribed=0.32, length=20.0):
@@ -1853,11 +1865,37 @@ def ahead_tdm32(x, path=None, y=0.0):
 
 
 def test_ramp():
-    assert speed_for_clearance(math.inf, 1.5, 2.0, 0.35) == 1.5
-    assert speed_for_clearance(2.0, 1.5, 2.0, 0.35) == 1.5
-    assert speed_for_clearance(0.35, 1.5, 2.0, 0.35) == 0.0
-    assert speed_for_clearance(0.1, 1.5, 2.0, 0.35) == 0.0
-    assert speed_for_clearance(1.175, 1.5, 2.0, 0.35) == pytest.approx(0.75)
+    assert speed_for_clearance(math.inf, 1.5, 2.0, 0.35, 0.15) == 1.5
+    assert speed_for_clearance(2.0, 1.5, 2.0, 0.35, 0.15) == 1.5
+    assert speed_for_clearance(0.35, 1.5, 2.0, 0.35, 0.15) == 0.0
+    assert speed_for_clearance(0.1, 1.5, 2.0, 0.35, 0.15) == 0.0
+    assert speed_for_clearance(1.175, 1.5, 2.0, 0.35, 0.15) == pytest.approx(0.75)
+    # the ramp gives 0.15 m/s at 0.515 m; from there to stop_distance it is the floor
+    assert speed_for_clearance(0.6, 1.5, 2.0, 0.35, 0.15) == pytest.approx(1.5 * 0.25 / 1.65)
+    assert speed_for_clearance(0.5, 1.5, 2.0, 0.35, 0.15) == 0.15
+    assert speed_for_clearance(0.36, 1.5, 2.0, 0.35, 0.15) == 0.15
+    # never above max_speed, even with a floor above it
+    assert speed_for_clearance(0.36, 0.1, 2.0, 0.35, 0.15) == 0.1
+
+
+def test_robot_values_stop_at_stop_distance_not_before():
+    """TDM-40: with hardware.yaml's values the old 0.05 m/s cut-off stopped the robot at 0.29 m."""
+    ramp = lambda c: speed_for_clearance(c, 1.0, 2.0, 0.2, 0.15)  # noqa: E731
+    assert ramp(0.2) == 0.0
+    assert ramp(0.19) == 0.0
+    assert ramp(0.2 + 1e-9) == 0.15
+    for clearance in (0.21, 0.25, 0.29, 0.4, 0.47):
+        assert ramp(clearance) == 0.15, clearance
+    assert ramp(1.1) == pytest.approx(0.5)
+    # the same through speed_limit, robot in front of a box on the path (band edge at x 5.40)
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
+    for x, clearance in ((5.11, 0.29), (5.19, 0.21)):
+        limit, c, status = speed_limit(costmap, 0.1, ahead_tdm32(x), (0.0, 0.0, 0.0), **ROBOT)
+        assert c == pytest.approx(clearance, abs=1e-6)
+        assert (limit, status) == (0.15, 'slow'), x
+    limit, c, status = speed_limit(costmap, 0.1, ahead_tdm32(5.21), (0.0, 0.0, 0.0), **ROBOT)
+    assert c == pytest.approx(0.19, abs=1e-6)
+    assert (limit, status) == (0.0, 'stop')
 
 
 def test_path_ahead_starts_at_the_robot_and_runs_lookahead_along_the_path():
@@ -1889,10 +1927,10 @@ def test_box_on_the_path_slows_then_stops_the_robot():
     near = speed_limit(costmap, 0.1, ahead_tdm32(5.1), (0.0, 0.0, 0.0), **LIMITS)
     assert near[1] == pytest.approx(0.3, abs=1e-6)
     assert near[0] == 0.0 and near[2] == 'stop'
-    # 0.38 m would still allow 0.027 m/s: too slow to be worth driving, so a stop
+    # at 0.38 m the ramp would allow 0.027 m/s; the floor keeps it moving to stop_distance
     creep = speed_limit(costmap, 0.1, ahead_tdm32(5.02), (0.0, 0.0, 0.0), **LIMITS)
     assert creep[1] == pytest.approx(0.38, abs=1e-6)
-    assert creep[0] == 0.0 and creep[2] == 'stop'
+    assert creep[0] == 0.15 and creep[2] == 'slow'
 
 
 def test_box_in_the_middle_of_a_3m_corridor_blocks_the_gap():
@@ -1969,7 +2007,8 @@ def test_costmap_from_occupancy_grid_message():
 def test_param_checks():
     assert governor_param_problem(**GOVERNOR_PARAMS) is None
     for name, value in [('slow_distance', 0.35), ('stop_distance', -0.1), ('clearance_lookahead', 0.0),
-                        ('costmap_timeout', 0.0), ('crawl_speed', -0.1)]:
+                        ('costmap_timeout', 0.0), ('crawl_speed', -0.1), ('obstacle_creep_speed', 0.0),
+                        ('obstacle_creep_speed', -0.1)]:
         assert governor_param_problem(**{**GOVERNOR_PARAMS, name: value}) is not None, (name, value)
     assert governor_param_problem(**{**GOVERNOR_PARAMS, 'crawl_speed': 0.0}) is None
 #+end_src
@@ -1988,7 +2027,7 @@ def costmap_speed_limit(self, state, path_xy, path_s):
     points = path_ahead(state, path_xy, path_s, self.progress_idx, self.clearance_lookahead)
     limit, clearance, status = speed_limit(
         self.costmap, age, points, costmap_pose, self.max_speed, self.slow_distance,
-        self.stop_distance, self.costmap_timeout, self.crawl_speed)
+        self.stop_distance, self.obstacle_creep_speed, self.costmap_timeout, self.crawl_speed)
 
     if status in ('missing', 'unplaced', 'stale'):
         problem = {

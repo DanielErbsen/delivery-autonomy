@@ -7,13 +7,14 @@ import numpy as np
 # Defaults, under the names the controller declares them as parameters
 GOVERNOR_PARAMS = {
     'use_costmap': True,
-    'slow_distance': 2.0,         # m: full speed beyond this clearance
-    'stop_distance': 0.35,        # m: zero at or below it
-    'clearance_lookahead': 3.0,   # m of path checked
-    'costmap_timeout': 1.0,       # s: older than this counts as no costmap
-    'crawl_speed': 0.3,           # m/s: the cap without a usable costmap
-    'goal_decel': 0.8,            # m/s^2: braking for the end of the path (End of Path)
-    'goal_creep_speed': 0.15,     # m/s: the taper never goes below this
+    'slow_distance': 2.0,          # m: full speed beyond this clearance
+    'stop_distance': 0.35,         # m: zero at or below it
+    'obstacle_creep_speed': 0.15,  # m/s: the obstacle limit's floor short of stop_distance
+    'clearance_lookahead': 3.0,    # m of path checked
+    'costmap_timeout': 1.0,        # s: older than this counts as no costmap
+    'crawl_speed': 0.3,            # m/s: the cap without a usable costmap
+    'goal_decel': 0.8,             # m/s^2: braking for the end of the path (End of Path)
+    'goal_creep_speed': 0.15,      # m/s: the taper never goes below this
 }
 
 # Nav2's OccupancyGrid: 100 lethal, 99 inscribed, 1-98 inflation, 0 free, -1 unknown
@@ -24,9 +25,6 @@ PATH_STEP = 0.1
 
 # How much closer (m) the path has to bring the robot to a cell for that cell to count
 CLOSER_BY = 0.01
-
-# m/s. An obstacle limit below this is a stop
-MIN_SPEED = 0.05
 
 
 class Costmap(NamedTuple):
@@ -44,9 +42,13 @@ class Costmap(NamedTuple):
                    msg.header.frame_id)
 
 
-def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_lookahead,
-                           costmap_timeout, crawl_speed, goal_decel, goal_creep_speed):
+def governor_param_problem(use_costmap, slow_distance, stop_distance, obstacle_creep_speed,
+                           clearance_lookahead, costmap_timeout, crawl_speed, goal_decel,
+                           goal_creep_speed):
     """Return why these settings are unusable, or None when they are fine."""
+    if not obstacle_creep_speed > 0.0:
+        return (f'obstacle_creep_speed must be positive (or the robot never reaches stop_distance), '
+                f'got {obstacle_creep_speed}')
     if not goal_decel > 0.0:
         return f'goal_decel must be positive, got {goal_decel}'
     if not goal_creep_speed > 0.0:
@@ -64,13 +66,15 @@ def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_
     return None
 
 
-def speed_for_clearance(clearance, max_speed, slow_distance, stop_distance):
-    """max_speed beyond slow_distance, linearly down to 0 at stop_distance."""
+def speed_for_clearance(clearance, max_speed, slow_distance, stop_distance, creep_speed):
+    """max_speed beyond slow_distance, then linearly down towards 0 at stop_distance but never
+    below creep_speed (nor above max_speed); 0 at or below stop_distance."""
     if clearance <= stop_distance:
         return 0.0
     if clearance >= slow_distance:
         return float(max_speed)
-    return float(max_speed * (clearance - stop_distance) / (slow_distance - stop_distance))
+    ramp = max_speed * (clearance - stop_distance) / (slow_distance - stop_distance)
+    return float(min(max(ramp, creep_speed), max_speed))
 
 
 def to_frame(points, frame_pose):
@@ -139,7 +143,7 @@ def obstacle_clearance(costmap, points, stop_distance):
 
 
 def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, stop_distance,
-                costmap_timeout, crawl_speed):
+                creep_speed, costmap_timeout, crawl_speed):
     """The speed limit for a robot at points[0] about to follow points[1:] (map frame).
 
     costmap: a Costmap or None; age: s since it arrived; costmap_pose: its frame's pose in map
@@ -152,9 +156,7 @@ def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, st
     if costmap_pose is None:
         return crawl, None, 'unplaced'
     clearance = obstacle_clearance(costmap, to_frame(points, costmap_pose), stop_distance)
-    limit = speed_for_clearance(clearance, max_speed, slow_distance, stop_distance)
-    if limit < MIN_SPEED:
-        limit = 0.0
+    limit = speed_for_clearance(clearance, max_speed, slow_distance, stop_distance, creep_speed)
     if age > costmap_timeout:
         return min(limit, crawl), clearance, 'stale'
     return limit, clearance, 'stop' if limit <= 0.0 else 'slow' if limit < max_speed else 'clear'
