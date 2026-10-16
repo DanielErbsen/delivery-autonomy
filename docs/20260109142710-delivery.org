@@ -1018,14 +1018,17 @@ if __name__ == '__main__':
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from shared_types.action import FollowPath
 from autonomy.utils.dynamics import INPUT_DIMENSION
 from autonomy.utils.reference_trajectory import process_path, get_local_reference
 from autonomy.utils.mppi_step import mppi_step
 from autonomy.utils.dynamics import dynamics_model
+from autonomy.utils.costmap_speed import (
+    GOVERNOR_PARAMS, Costmap, governor_param_problem, path_ahead, speed_limit)
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
@@ -1058,6 +1061,8 @@ class ControllerActionServer(Node):
 
         <<state_sub>>
 
+        <<costmap_sub>>
+
         <<controller_outputs>>
 
         <<controller_params>>
@@ -1068,6 +1073,8 @@ class ControllerActionServer(Node):
 
     <<state_callback>>
 
+    <<costmap_callback>>
+
     <<on_set_parameters>>
 
     <<publish_command>>
@@ -1075,6 +1082,8 @@ class ControllerActionServer(Node):
     <<execute_controller_callback>>
 
     <<control_loop_callback>>
+
+    <<costmap_speed_limit>>
 
 def main(args=None):
     rclpy.init(args=args)
@@ -1164,6 +1173,7 @@ def process_state_callback(self, odom_msg: Odometry):
                 f'No map->{odom_msg.header.frame_id} transform yet: {ex}', throttle_duration_sec=2.0)
             return None
     map_x, map_y, map_yaw = self._map_to_odom
+    self._odom_frame = odom_msg.header.frame_id
 
     # Extract Position and Yaw (theta) in Map frame
     p = odom_msg.pose.pose.position
@@ -1182,6 +1192,32 @@ def process_state_callback(self, odom_msg: Odometry):
     self.current_state = np.array([x, y, theta, v, omega, b_omega])
 #+end_src
 
+The controller also reads Nav2's costmap, to slow down and stop for obstacles near the path (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]). planner_server publishes it latched (reliable, transient local, depth 1), so the subscription asks for the same and gets the latest grid as soon as it connects. The callback only keeps the grid and the time it arrived. Age is measured on arrival, by this node's clock, because the grid's own stamp says when it was sent, not how fresh its contents are.
+
+#+name: costmap_sub
+#+begin_src python
+self.declare_parameter("costmap_topic", "/global_costmap/costmap")
+costmap_topic = self.get_parameter("costmap_topic").value
+
+self.costmap = None
+self.costmap_arrival = None
+self.costmap_subscription = self.create_subscription(
+    OccupancyGrid,
+    costmap_topic,
+    self.process_costmap_callback,
+    QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+               durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    callback_group=self.state_cb_group,
+)
+#+end_src
+
+#+name: costmap_callback
+#+begin_src python
+def process_costmap_callback(self, msg: OccupancyGrid):
+    self.costmap = Costmap.from_msg(msg)
+    self.costmap_arrival = self.get_clock().now()
+#+end_src
+
 ** Parameters
 Speed and goal tolerances are ROS parameters. Their defaults are the values this controller always used.
 
@@ -1191,6 +1227,20 @@ Speed and goal tolerances are ROS parameters. Their defaults are the values this
 | =min_speed=          |    -0.5 | m/s. The reverse cap on =/cmd_vel=. 0 forbids reversing.                  |
 | =xy_goal_tolerance=  |    0.25 | m. How close to the end of the path counts as arrived.                    |
 | =yaw_goal_tolerance= |    0.15 | rad. How closely the heading has to match the end of the path.            |
+
+The obstacle speed limit has its own (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]):
+
+| Parameter             | Default | Meaning                                                                          |
+|-----------------------+---------+----------------------------------------------------------------------------------|
+| =use_costmap=         | true    | Slow down and stop for obstacles in the costmap. false = ignore it altogether.   |
+| =slow_distance=       |     2.0 | m. Clearance below which the robot starts slowing down.                          |
+| =stop_distance=       |    0.35 | m. Clearance at which it stops (and waits, goal kept).                           |
+| =clearance_lookahead= |     3.0 | m. How much of the path ahead is checked.                                        |
+| =costmap_timeout=     |     1.0 | s. A costmap older than this, or none at all, caps the speed at =crawl_speed=.   |
+| =crawl_speed=         |     0.3 | m/s. The cap without a fresh costmap.                                            |
+| =costmap_topic=       | =/global_costmap/costmap= | Read once at startup.                                    |
+
+With =use_costmap= true and no costmap at all (Nav2 not running), the robot only ever crawls. Set it to false to follow paths without Nav2.
 
 They can be set at launch (e.g. ~max_speed:=0.8~; write doubles, ~1.0~ not ~1~) or changed while running with ~ros2 param set /controller_server max_speed 0.8~. A value that fails the checks below is refused: at startup the node will not start, and at runtime the set is rejected with the reason. Speeds are checked against MPPI's sampling bounds because MPPI never samples outside them, so a cap beyond them would never be reached. =min_speed= may not be positive, or the stop command (zero) would be clipped into motion.
 
@@ -1219,6 +1269,11 @@ def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_t
     if not yaw_goal_tolerance > 0.0:
         return f'yaw_goal_tolerance must be positive, got {yaw_goal_tolerance}'
     return None
+
+def param_problem(settings):
+    """Check a full set of controller and speed-limit settings (a dict by parameter name)."""
+    return (controller_param_problem(**{name: settings[name] for name in CONTROLLER_PARAMS})
+            or governor_param_problem(**{name: settings[name] for name in GOVERNOR_PARAMS}))
 #+end_src
 
 The checks don't touch ROS, so they get a plain pytest (=python -m pytest src/autonomy/test= with the workspace sourced).
@@ -1248,9 +1303,10 @@ def test_tolerances_must_be_positive():
 
 #+name: controller_params
 #+begin_src python
-for name, default in CONTROLLER_PARAMS.items():
+self.param_names = (*CONTROLLER_PARAMS, *GOVERNOR_PARAMS)
+for name, default in {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS}.items():
     setattr(self, name, self.declare_parameter(name, default).value)
-problem = controller_param_problem(**{name: getattr(self, name) for name in CONTROLLER_PARAMS})
+problem = param_problem({name: getattr(self, name) for name in self.param_names})
 if problem:
     raise ValueError(problem)
 self.add_on_set_parameters_callback(self.on_set_parameters)
@@ -1261,9 +1317,9 @@ A runtime change is checked together with the values it leaves unchanged, then a
 #+name: on_set_parameters
 #+begin_src python
 def on_set_parameters(self, params):
-    settings = {name: getattr(self, name) for name in CONTROLLER_PARAMS}
+    settings = {name: getattr(self, name) for name in self.param_names}
     settings.update((p.name, p.value) for p in params if p.name in settings)
-    problem = controller_param_problem(**settings)
+    problem = param_problem(settings)
     if problem:
         return SetParametersResult(successful=False, reason=problem)
     for name, value in settings.items():
@@ -1359,6 +1415,8 @@ self.progress_idx = 0
 self.last_u = None
 self._goal_done = None
 self._map_to_odom = None
+self._odom_frame = None
+self._speed_status = None
 #+end_src
 
 #+name: control_loop_callback
@@ -1381,6 +1439,16 @@ def control_loop_callback(self):
     # it was when the solve started
     future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt) if self.last_u is not None else self.current_state
 
+    # Obstacles near the path ahead lower the speed (see Obstacle Speed Limit).
+    # A plain float: a numpy scalar would make jax compile mppi_step a second time.
+    V_TARGET = float(min(V_TARGET, self.costmap_speed_limit(future_state, path_xy, path_s)))
+    if V_TARGET <= 0.0:
+        # Too close: hold still, keep the goal, and look again next tick
+        u = np.zeros(INPUT_DIMENSION)
+        self.publish_command(u)
+        self.last_u = u
+        return
+
     ref_traj_np, self.progress_idx = get_local_reference(
         future_state,
         path_xy,
@@ -1395,17 +1463,20 @@ def control_loop_callback(self):
 
     self.rng, iter_key = jax.random.split(self.rng)
 
+    # [min_v, min_delta]. The speed cap is this tick's target, so a lowered target
+    # caps the command too.
+    lower_bounds = jnp.array([self.min_speed, -0.6])
+    upper_bounds = jnp.array([V_TARGET, 0.6])
+
     U_opt = mppi_step(
         key=iter_key,
         x0=future_state,
-        U_nominal=self.U_nominal,
+        # The warm start may still hold speeds above a target that just dropped
+        U_nominal=jnp.clip(self.U_nominal, lower_bounds, upper_bounds),
         ref_traj=ref_traj_jax,
         v_target=V_TARGET,
     )
 
-    # [min_v, min_delta]
-    lower_bounds = jnp.array([self.min_speed, -0.6])
-    upper_bounds = jnp.array([self.max_speed, 0.6])
     U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
 
     u = U_opt[0]
@@ -1438,6 +1509,383 @@ if dist_to_goal < self.xy_goal_tolerance and yaw_err < self.yaw_goal_tolerance:
     self.active_goal = False
     self._finish_goal(reached=True)
     return
+#+end_src
+
+*** Obstacle Speed Limit
+MPPI only tracks the path. It knows nothing about obstacles. Nav2's local planner routes the path round whatever the costmap shows, but it replans only twice a second, and a 2D lidar sees the near face of a box long before its sides. In TDM-25's sim runs the paths swung back towards the centreline through the part of a box nobody had seen yet, and at 1.5 m/s the robot passed a box in the middle of a corridor 0.00-0.24 m away. So every tick the controller checks the path ahead against the costmap. When the path would take it close to something, it slows down, or stops.
+
+The obstacles are cells of 99 (inscribed) and 100 (lethal). Nav2 marks a cell 99 when a robot centred there would have its footprint's inscribed circle (radius 0.32 m) touching an obstacle. The distance from the robot's centre to the nearest such cell is then about the gap between the side of the footprint and the obstacle. At the front the real gap is ~0.08 m less, at a corner up to 0.19 m less. That way the costmap brings the footprint along, and the controller needs no copy of it. Distances are measured to the nearest edge of a cell, not its centre, because a centre anywhere in the cell collides. On a 0.1 m grid that keeps the measured gap from coming out larger than the real one, which matters in a gap only a little wider than the robot.
+
+Not every such cell counts. In a 3 m corridor the walls are always about 1.2 m from the robot, closer than =slow_distance=, so measuring to them would keep the robot at half speed for good. The cells that count are the ones the path ahead (the next =clearance_lookahead= metres) passes within =stop_distance= of, and only if following the path brings the robot closer to them. The clearance is the distance from the robot to the nearest of these. The speed limit is =max_speed= beyond =slow_distance=, then falls linearly to zero at =stop_distance=. A limit below 0.05 m/s counts as zero: with the speed proportional to the distance left, the robot only ever creeps up to =stop_distance=, and in the sim it inched along at 0.01 m/s without ever counting as stopped. At zero the controller sends zero and keeps the goal open. It drives on once the costmap clears, or once local_planner sends a path that keeps =stop_distance=. The "closer" condition stops the robot from locking itself in place. Something beside or behind the robot that the path leads away from does not count, even inside =stop_distance=.
+
+The robot therefore never drives through a gap narrower than its width plus twice =stop_distance= (0.63 + 0.7 m with the defaults). It waits in front of it instead. A box in the middle of a 3 m corridor leaves two 1.2 m gaps, so the robot stops there. Squeezing past would leave at most 0.27 m on each side.
+
+Measured in the sim (TDM-32, TDM-25's route with a 0.6 m box, ground truth):
+- No box: not slowed once in 190 m.
+- Box in the middle of the corridor: slows from about 2 m out and stops 0.24-0.29 m from it, goal still open. Once the box is removed it drives on within half a second.
+- Box 0.45 m off-centre: slows to 0.64 m/s while the path still runs through the box's unseen side, then passes 0.49 m away. TDM-25 measured 0.36 m without the speed limit.
+- Box in the middle with =stop_distance= 0.2: squeezes through at 0.3-0.4 m/s, 0.24 m from the box, with three short stops in the gap.
+The check takes under 0.2 ms a tick.
+
+Without a usable costmap the speed is capped at =crawl_speed=: none has arrived yet, the last one is older than =costmap_timeout=, or it is in a frame the controller cannot place. A stale costmap still stops the robot for what it shows. The path and the robot state are in map, while Nav2's costmap is in odom (=nav2_local.yaml=). The points are moved into the costmap's frame with the cached map->odom. A costmap in map is used as it is.
+
+The geometry has no ROS in it, so it lives in a module of its own with plain tests. The MPPI obstacle cost can reuse =Costmap= and =to_frame=.
+
+#+begin_src python :tangle ../src/autonomy/autonomy/utils/costmap_speed.py
+"""Speed limit from Nav2's costmap: slow down near obstacles on the path ahead, stop short of them."""
+import math
+from typing import NamedTuple
+
+import numpy as np
+
+# Defaults, under the names the controller declares them as parameters
+GOVERNOR_PARAMS = {
+    'use_costmap': True,
+    'slow_distance': 2.0,         # m: full speed beyond this clearance
+    'stop_distance': 0.35,        # m: zero at or below it
+    'clearance_lookahead': 3.0,   # m of path checked
+    'costmap_timeout': 1.0,       # s: older than this counts as no costmap
+    'crawl_speed': 0.3,           # m/s: the cap without a usable costmap
+}
+
+# Nav2's OccupancyGrid: 100 lethal, 99 inscribed, 1-98 inflation, 0 free, -1 unknown
+INSCRIBED = 99
+
+# Spacing of the points checked along the path, about one costmap cell
+PATH_STEP = 0.1
+
+# How much closer (m) the path has to bring the robot to a cell for that cell to count
+CLOSER_BY = 0.01
+
+# m/s. An obstacle limit below this is a stop
+MIN_SPEED = 0.05
+
+
+class Costmap(NamedTuple):
+    cells: np.ndarray   # (height, width) int8; row = y, column = x
+    resolution: float   # m per cell
+    origin: tuple       # (x, y) of the outer corner of cell [0, 0], in `frame`
+    frame: str
+
+    @classmethod
+    def from_msg(cls, msg):
+        """From a nav_msgs/OccupancyGrid. Nav2 never rotates the origin, so its orientation is ignored."""
+        info = msg.info
+        cells = np.asarray(msg.data, dtype=np.int8).reshape(info.height, info.width)
+        return cls(cells, info.resolution, (info.origin.position.x, info.origin.position.y),
+                   msg.header.frame_id)
+
+
+def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_lookahead,
+                           costmap_timeout, crawl_speed):
+    """Return why these settings are unusable, or None when they are fine."""
+    if not stop_distance >= 0.0:
+        return f'stop_distance must be >= 0 m, got {stop_distance}'
+    if not slow_distance > stop_distance:
+        return f'slow_distance must be greater than stop_distance ({stop_distance} m), got {slow_distance}'
+    if not clearance_lookahead > 0.0:
+        return f'clearance_lookahead must be positive, got {clearance_lookahead}'
+    if not costmap_timeout > 0.0:
+        return f'costmap_timeout must be positive, got {costmap_timeout}'
+    if not crawl_speed >= 0.0:
+        return f'crawl_speed must be >= 0 m/s, got {crawl_speed}'
+    return None
+
+
+def speed_for_clearance(clearance, max_speed, slow_distance, stop_distance):
+    """max_speed beyond slow_distance, linearly down to 0 at stop_distance."""
+    if clearance <= stop_distance:
+        return 0.0
+    if clearance >= slow_distance:
+        return float(max_speed)
+    return float(max_speed * (clearance - stop_distance) / (slow_distance - stop_distance))
+
+
+def to_frame(points, frame_pose):
+    """Map-frame points (N, 2) into a frame whose pose in map is (x, y, yaw)."""
+    x, y, yaw = frame_pose
+    c, s = math.cos(yaw), math.sin(yaw)
+    d = np.asarray(points, dtype=float) - (x, y)
+    return np.column_stack((c * d[:, 0] + s * d[:, 1], c * d[:, 1] - s * d[:, 0]))
+
+
+def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
+    """`position`, then points every `step` m along the path, from the position's projection
+    onto the path to `length` m further on (or the end of the path). Like get_local_reference,
+    the projection is searched from `start_idx`, the progress so far."""
+    position = np.asarray(position, dtype=float)[:2]
+    end = min(len(path_xy), start_idx + 50)
+    i = start_idx + int(np.argmin(np.linalg.norm(path_xy[start_idx:end] - position, axis=1)))
+    best, s0 = np.linalg.norm(path_xy[i] - position), path_s[i]
+    for j in (i - 1, i):   # the segments either side of the closest point
+        if 0 <= j < len(path_xy) - 1:
+            a, v = path_xy[j], path_xy[j + 1] - path_xy[j]
+            seg2 = float(v @ v)
+            if seg2 > 0.0:
+                t = min(max(float((position - a) @ v) / seg2, 0.0), 1.0)
+                d = np.linalg.norm(a + t * v - position)
+                if d < best:
+                    best, s0 = d, path_s[j] + t * math.sqrt(seg2)
+    s1 = min(s0 + length, path_s[-1])
+    s = np.append(np.arange(s0, s1, step), s1)
+    ahead = np.column_stack((np.interp(s, path_s, path_xy[:, 0]), np.interp(s, path_s, path_xy[:, 1])))
+    return np.vstack((position, ahead))
+
+
+def obstacle_clearance(costmap, points, stop_distance):
+    """Distance from points[0] (the robot) to the nearest inscribed or lethal cell that the path
+    points[1:] passes within stop_distance of and brings the robot closer to. All in the
+    costmap's frame. inf when there is none."""
+    res = costmap.resolution
+    ox, oy = costmap.origin
+    height, width = costmap.cells.shape
+    # Only cells within stop_distance of a path point can count
+    lo = points.min(axis=0) - stop_distance
+    hi = points.max(axis=0) + stop_distance
+    c0, c1 = max(int((lo[0] - ox) // res), 0), min(int((hi[0] - ox) // res) + 1, width)
+    r0, r1 = max(int((lo[1] - oy) // res), 0), min(int((hi[1] - oy) // res) + 1, height)
+    if c0 >= c1 or r0 >= r1:
+        return math.inf
+    rows, cols = np.nonzero(costmap.cells[r0:r1, c0:c1] >= INSCRIBED)
+    if rows.size == 0:
+        return math.inf
+    centres = np.column_stack((ox + (cols + c0 + 0.5) * res, oy + (rows + r0 + 0.5) * res))
+    # To the nearest point of each cell, not its centre: (cells, points)
+    gap = np.maximum(np.abs(centres[:, None, :] - points[None, :, :]) - res / 2, 0.0)
+    dist = np.hypot(gap[..., 0], gap[..., 1])
+    now = dist[:, 0]
+    ahead = dist[:, 1:].min(axis=1) if len(points) > 1 else now
+    counts = (ahead < stop_distance) & (ahead < now - CLOSER_BY)
+    return float(now[counts].min()) if counts.any() else math.inf
+
+
+def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, stop_distance,
+                costmap_timeout, crawl_speed):
+    """The speed limit for a robot at points[0] about to follow points[1:] (map frame).
+
+    costmap: a Costmap or None; age: s since it arrived; costmap_pose: its frame's pose in map
+    as (x, y, yaw), or None if unknown. Returns (limit m/s, clearance m or None, status), status
+    one of 'clear', 'slow', 'stop' (fresh costmap) or 'missing', 'unplaced', 'stale' (capped at
+    crawl_speed; a stale costmap still stops the robot for what it shows)."""
+    crawl = min(crawl_speed, max_speed)
+    if costmap is None:
+        return crawl, None, 'missing'
+    if costmap_pose is None:
+        return crawl, None, 'unplaced'
+    clearance = obstacle_clearance(costmap, to_frame(points, costmap_pose), stop_distance)
+    limit = speed_for_clearance(clearance, max_speed, slow_distance, stop_distance)
+    if limit < MIN_SPEED:
+        limit = 0.0
+    if age > costmap_timeout:
+        return min(limit, crawl), clearance, 'stale'
+    return limit, clearance, 'stop' if limit <= 0.0 else 'slow' if limit < max_speed else 'clear'
+#+end_src
+
+The tests build small grids by hand: a 3 m corridor, a box on the path, a box beside it (=python -m pytest src/autonomy/test= with the workspace sourced).
+
+#+begin_src python :tangle ../src/autonomy/test/test_costmap_speed.py :mkdirp yes
+import math
+
+import numpy as np
+import pytest
+
+from autonomy.utils.costmap_speed import (
+    GOVERNOR_PARAMS, Costmap, governor_param_problem, obstacle_clearance, path_ahead,
+    speed_for_clearance, speed_limit, to_frame)
+
+RES = 0.1
+LIMITS = dict(max_speed=1.5, slow_distance=2.0, stop_distance=0.35, costmap_timeout=1.0, crawl_speed=0.3)
+
+
+def corridor_tdm32(half_width=1.5, inscribed=0.32, length=20.0):
+    """A straight corridor along +x through y = 0, in odom with its corner at (-5, -5): walls
+    lethal, the inscribed band inside them 99, free in between."""
+    h, w = int(10 / RES), int(length / RES)
+    y = -5 + (np.arange(h) + 0.5) * RES
+    cells = np.zeros((h, w), dtype=np.int8)
+    cells[np.abs(y) >= half_width - inscribed, :] = 99
+    cells[np.abs(y) >= half_width, :] = 100
+    return Costmap(cells, RES, (-5.0, -5.0), 'odom')
+
+
+def add_box_tdm32(costmap, cx, cy, size=0.6, inscribed=0.32):
+    """Mark a square box lethal and the band round it inscribed (as a square, close enough)."""
+    ox, oy = costmap.origin
+    h, w = costmap.cells.shape
+    x = ox + (np.arange(w) + 0.5) * RES
+    y = oy + (np.arange(h) + 0.5) * RES
+    dx, dy = np.abs(x[None, :] - cx), np.abs(y[:, None] - cy)
+    cells = costmap.cells.copy()
+    cells[(dx <= size / 2 + inscribed) & (dy <= size / 2 + inscribed)] = 99
+    cells[(dx <= size / 2) & (dy <= size / 2)] = 100
+    return costmap._replace(cells=cells)
+
+
+def straight_path_tdm32(x0=0.0, x1=12.0):
+    xy = np.column_stack((np.arange(x0, x1 + 1e-9, 0.1), np.zeros(int(round((x1 - x0) / 0.1)) + 1)))
+    return xy, np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))))
+
+
+def ahead_tdm32(x, path=None, y=0.0):
+    """The robot at (x, y) and the next 3 m of a path sampled every 0.1 m from x = 0."""
+    xy, s = path if path is not None else straight_path_tdm32()
+    return path_ahead((x, y), xy, s, max(int(x / 0.1) - 5, 0), 3.0)
+
+
+def test_ramp():
+    assert speed_for_clearance(math.inf, 1.5, 2.0, 0.35) == 1.5
+    assert speed_for_clearance(2.0, 1.5, 2.0, 0.35) == 1.5
+    assert speed_for_clearance(0.35, 1.5, 2.0, 0.35) == 0.0
+    assert speed_for_clearance(0.1, 1.5, 2.0, 0.35) == 0.0
+    assert speed_for_clearance(1.175, 1.5, 2.0, 0.35) == pytest.approx(0.75)
+
+
+def test_path_ahead_starts_at_the_robot_and_runs_lookahead_along_the_path():
+    pts = ahead_tdm32(2.04, y=0.3)
+    assert pts[0] == pytest.approx([2.04, 0.3])
+    assert pts[1] == pytest.approx([2.04, 0.0])     # its projection, between two path points
+    assert pts[-1] == pytest.approx([5.04, 0.0])
+    assert np.diff(pts[1:, 0]).max() <= 0.1 + 1e-9
+
+
+def test_path_ahead_stops_at_the_end_of_the_path():
+    assert ahead_tdm32(11.0)[-1] == pytest.approx([12.0, 0.0])
+
+
+def test_corridor_walls_do_not_slow_the_robot():
+    assert obstacle_clearance(corridor_tdm32(), ahead_tdm32(2.0), 0.35) == math.inf
+    limit, _, status = speed_limit(corridor_tdm32(), 0.1, ahead_tdm32(2.0), (0.0, 0.0, 0.0), **LIMITS)
+    assert (limit, status) == (1.5, 'clear')
+
+
+def test_box_on_the_path_slows_then_stops_the_robot():
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
+    # the inscribed band's first cells are centred on x 5.45, so their near edge is at 5.40
+    far = speed_limit(costmap, 0.1, ahead_tdm32(2.0), (0.0, 0.0, 0.0), **LIMITS)
+    assert far[0] == 1.5 and far[2] == 'clear'      # path ends at 5.0, 0.40 m short of the band
+    mid = speed_limit(costmap, 0.1, ahead_tdm32(4.4), (0.0, 0.0, 0.0), **LIMITS)
+    assert mid[1] == pytest.approx(1.0, abs=1e-6)
+    assert mid[0] == pytest.approx(1.5 * (1.0 - 0.35) / 1.65) and mid[2] == 'slow'
+    near = speed_limit(costmap, 0.1, ahead_tdm32(5.1), (0.0, 0.0, 0.0), **LIMITS)
+    assert near[1] == pytest.approx(0.3, abs=1e-6)
+    assert near[0] == 0.0 and near[2] == 'stop'
+    # 0.38 m would still allow 0.027 m/s: too slow to be worth driving, so a stop
+    creep = speed_limit(costmap, 0.1, ahead_tdm32(5.02), (0.0, 0.0, 0.0), **LIMITS)
+    assert creep[1] == pytest.approx(0.38, abs=1e-6)
+    assert creep[0] == 0.0 and creep[2] == 'stop'
+
+
+def test_box_in_the_middle_of_a_3m_corridor_blocks_the_gap():
+    """A centred 0.6 m box leaves 1.2 m gaps; a path through one keeps < 0.35 m on both sides."""
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
+    # the path swerves round the box to y 0.9, the middle of the gap
+    x = np.arange(0.0, 12.0 + 1e-9, 0.1)
+    xy = np.column_stack((x, 0.9 * np.exp(-((x - 6.0) / 1.5) ** 2)))
+    path = (xy, np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1)))))
+    on_path = lambda x0: ahead_tdm32(x0, path, np.interp(x0, xy[:, 0], xy[:, 1]))  # noqa: E731
+    assert 0.35 < obstacle_clearance(costmap, on_path(3.8), 0.35) < 2.0   # slowing already
+    assert obstacle_clearance(costmap, on_path(5.2), 0.35) <= 0.35        # stopped at the gap
+
+
+def test_box_beside_the_path_with_room_to_spare_is_ignored():
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 1.1)   # box from y 0.8, its band from 0.5
+    assert obstacle_clearance(costmap, ahead_tdm32(4.0), 0.35) == math.inf
+
+
+def test_obstacle_the_path_leads_away_from_does_not_lock_the_robot():
+    costmap = add_box_tdm32(corridor_tdm32(), 4.6, 0.95)  # band x 4.0-5.2, down to y 0.30
+    # just past the band, still within 0.35 m of its last cells: free to drive on
+    assert obstacle_clearance(costmap, ahead_tdm32(5.3), 0.35) == math.inf
+    # level with its start, the same box stops the robot
+    assert obstacle_clearance(costmap, ahead_tdm32(4.0), 0.35) <= 0.35
+
+
+def test_map_to_odom_is_applied():
+    # costmap in odom; odom sits at (100, 50) in map, rotated 90 deg
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
+    pose = (100.0, 50.0, math.pi / 2)
+    odom_pts = ahead_tdm32(4.4)
+    c, s = math.cos(pose[2]), math.sin(pose[2])
+    map_pts = np.column_stack((pose[0] + c * odom_pts[:, 0] - s * odom_pts[:, 1],
+                               pose[1] + s * odom_pts[:, 0] + c * odom_pts[:, 1]))
+    assert to_frame(map_pts, pose) == pytest.approx(odom_pts)
+    limit, clearance, _ = speed_limit(costmap, 0.1, map_pts, pose, **LIMITS)
+    assert clearance == pytest.approx(1.0, abs=1e-6)
+
+
+def test_missing_unplaced_and_stale_costmaps_crawl():
+    pts = ahead_tdm32(2.0)
+    assert speed_limit(None, None, pts, None, **LIMITS) == (0.3, None, 'missing')
+    assert speed_limit(corridor_tdm32(), 0.1, pts, None, **LIMITS) == (0.3, None, 'unplaced')
+    limit, _, status = speed_limit(corridor_tdm32(), 1.5, pts, (0.0, 0.0, 0.0), **LIMITS)
+    assert (limit, status) == (0.3, 'stale')
+    # the crawl never exceeds max_speed
+    assert speed_limit(None, None, pts, None, **{**LIMITS, 'max_speed': 0.2})[0] == 0.2
+
+
+def test_stale_costmap_still_stops_for_what_it_shows():
+    costmap = add_box_tdm32(corridor_tdm32(), 6.0, 0.0)
+    limit, _, status = speed_limit(costmap, 5.0, ahead_tdm32(5.1), (0.0, 0.0, 0.0), **LIMITS)
+    assert (limit, status) == (0.0, 'stale')
+
+
+def test_costmap_from_occupancy_grid_message():
+    class Msg:   # the fields of a nav_msgs/OccupancyGrid that are read
+        class header:
+            frame_id = 'odom'
+
+        class info:
+            width, height, resolution = 3, 2, 0.1
+
+            class origin:
+                class position:
+                    x, y = -1.0, 2.0
+        data = [0, 0, 100, 99, -1, 0]
+    costmap = Costmap.from_msg(Msg)
+    assert costmap.cells.shape == (2, 3) and costmap.cells[0, 2] == 100 and costmap.cells[1, 0] == 99
+    assert costmap.origin == (-1.0, 2.0) and costmap.frame == 'odom'
+
+
+def test_param_checks():
+    assert governor_param_problem(**GOVERNOR_PARAMS) is None
+    for name, value in [('slow_distance', 0.35), ('stop_distance', -0.1), ('clearance_lookahead', 0.0),
+                        ('costmap_timeout', 0.0), ('crawl_speed', -0.1)]:
+        assert governor_param_problem(**{**GOVERNOR_PARAMS, name: value}) is not None, (name, value)
+    assert governor_param_problem(**{**GOVERNOR_PARAMS, 'crawl_speed': 0.0}) is None
+#+end_src
+
+#+name: costmap_speed_limit
+#+begin_src python
+def costmap_speed_limit(self, state, path_xy, path_s):
+    """The fastest the costmap lets the robot go on from `state` along the path."""
+    if not self.use_costmap:
+        return self.max_speed
+    age = costmap_pose = None
+    if self.costmap is not None:
+        age = (self.get_clock().now() - self.costmap_arrival).nanoseconds * 1e-9
+        costmap_pose = {'map': (0.0, 0.0, 0.0),
+                        self._odom_frame: self._map_to_odom}.get(self.costmap.frame)
+    points = path_ahead(state, path_xy, path_s, self.progress_idx, self.clearance_lookahead)
+    limit, clearance, status = speed_limit(
+        self.costmap, age, points, costmap_pose, self.max_speed, self.slow_distance,
+        self.stop_distance, self.costmap_timeout, self.crawl_speed)
+
+    if status in ('missing', 'unplaced', 'stale'):
+        problem = {
+            'missing': f'no costmap on {self.costmap_subscription.topic_name} yet',
+            'unplaced': f'costmap in frame "{self.costmap.frame if self.costmap else ""}", '
+                        f'neither map nor {self._odom_frame}',
+            'stale': f'costmap {age:.1f} s old',
+        }[status]
+        self.get_logger().warning(f'{problem}: speed capped at {limit:.2f} m/s',
+                                  throttle_duration_sec=5.0)
+    elif status == 'stop' and self._speed_status != 'stop':
+        self.get_logger().info(
+            f'Obstacle {clearance:.2f} m away near the path ahead: stopped until it clears')
+    elif status != 'stop' and self._speed_status == 'stop':
+        self.get_logger().info('Path ahead clear: driving on')
+    self._speed_status = status
+    return limit
 #+end_src
 
 *** Reference Trajectory

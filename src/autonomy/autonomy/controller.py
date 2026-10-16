@@ -7,14 +7,17 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from shared_types.action import FollowPath
 from autonomy.utils.dynamics import INPUT_DIMENSION
 from autonomy.utils.reference_trajectory import process_path, get_local_reference
 from autonomy.utils.mppi_step import mppi_step
 from autonomy.utils.dynamics import dynamics_model
+from autonomy.utils.costmap_speed import (
+    GOVERNOR_PARAMS, Costmap, governor_param_problem, path_ahead, speed_limit)
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
@@ -45,6 +48,11 @@ def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_t
     if not yaw_goal_tolerance > 0.0:
         return f'yaw_goal_tolerance must be positive, got {yaw_goal_tolerance}'
     return None
+
+def param_problem(settings):
+    """Check a full set of controller and speed-limit settings (a dict by parameter name)."""
+    return (controller_param_problem(**{name: settings[name] for name in CONTROLLER_PARAMS})
+            or governor_param_problem(**{name: settings[name] for name in GOVERNOR_PARAMS}))
 
 class ControllerActionServer(Node):
     def __init__(self):
@@ -77,13 +85,28 @@ class ControllerActionServer(Node):
             callback_group=self.state_cb_group,
         )
 
+        self.declare_parameter("costmap_topic", "/global_costmap/costmap")
+        costmap_topic = self.get_parameter("costmap_topic").value
+        
+        self.costmap = None
+        self.costmap_arrival = None
+        self.costmap_subscription = self.create_subscription(
+            OccupancyGrid,
+            costmap_topic,
+            self.process_costmap_callback,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            callback_group=self.state_cb_group,
+        )
+
         self.cmd_pub = self.create_publisher(
             Twist, "/cmd_vel", 10
         )
 
-        for name, default in CONTROLLER_PARAMS.items():
+        self.param_names = (*CONTROLLER_PARAMS, *GOVERNOR_PARAMS)
+        for name, default in {**CONTROLLER_PARAMS, **GOVERNOR_PARAMS}.items():
             setattr(self, name, self.declare_parameter(name, default).value)
-        problem = controller_param_problem(**{name: getattr(self, name) for name in CONTROLLER_PARAMS})
+        problem = param_problem({name: getattr(self, name) for name in self.param_names})
         if problem:
             raise ValueError(problem)
         self.add_on_set_parameters_callback(self.on_set_parameters)
@@ -102,6 +125,8 @@ class ControllerActionServer(Node):
         self.last_u = None
         self._goal_done = None
         self._map_to_odom = None
+        self._odom_frame = None
+        self._speed_status = None
 
         self.get_logger().info('Controller Action Server initialized.')
 
@@ -120,6 +145,7 @@ class ControllerActionServer(Node):
                     f'No map->{odom_msg.header.frame_id} transform yet: {ex}', throttle_duration_sec=2.0)
                 return None
         map_x, map_y, map_yaw = self._map_to_odom
+        self._odom_frame = odom_msg.header.frame_id
     
         # Extract Position and Yaw (theta) in Map frame
         p = odom_msg.pose.pose.position
@@ -137,10 +163,14 @@ class ControllerActionServer(Node):
     
         self.current_state = np.array([x, y, theta, v, omega, b_omega])
 
+    def process_costmap_callback(self, msg: OccupancyGrid):
+        self.costmap = Costmap.from_msg(msg)
+        self.costmap_arrival = self.get_clock().now()
+
     def on_set_parameters(self, params):
-        settings = {name: getattr(self, name) for name in CONTROLLER_PARAMS}
+        settings = {name: getattr(self, name) for name in self.param_names}
         settings.update((p.name, p.value) for p in params if p.name in settings)
-        problem = controller_param_problem(**settings)
+        problem = param_problem(settings)
         if problem:
             return SetParametersResult(successful=False, reason=problem)
         for name, value in settings.items():
@@ -231,6 +261,16 @@ class ControllerActionServer(Node):
         # it was when the solve started
         future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt) if self.last_u is not None else self.current_state
     
+        # Obstacles near the path ahead lower the speed (see Obstacle Speed Limit).
+        # A plain float: a numpy scalar would make jax compile mppi_step a second time.
+        V_TARGET = float(min(V_TARGET, self.costmap_speed_limit(future_state, path_xy, path_s)))
+        if V_TARGET <= 0.0:
+            # Too close: hold still, keep the goal, and look again next tick
+            u = np.zeros(INPUT_DIMENSION)
+            self.publish_command(u)
+            self.last_u = u
+            return
+    
         ref_traj_np, self.progress_idx = get_local_reference(
             future_state,
             path_xy,
@@ -245,17 +285,20 @@ class ControllerActionServer(Node):
     
         self.rng, iter_key = jax.random.split(self.rng)
     
+        # [min_v, min_delta]. The speed cap is this tick's target, so a lowered target
+        # caps the command too.
+        lower_bounds = jnp.array([self.min_speed, -0.6])
+        upper_bounds = jnp.array([V_TARGET, 0.6])
+    
         U_opt = mppi_step(
             key=iter_key,
             x0=future_state,
-            U_nominal=self.U_nominal,
+            # The warm start may still hold speeds above a target that just dropped
+            U_nominal=jnp.clip(self.U_nominal, lower_bounds, upper_bounds),
             ref_traj=ref_traj_jax,
             v_target=V_TARGET,
         )
     
-        # [min_v, min_delta]
-        lower_bounds = jnp.array([self.min_speed, -0.6])
-        upper_bounds = jnp.array([self.max_speed, 0.6])
         U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
     
         u = U_opt[0]
@@ -265,6 +308,37 @@ class ControllerActionServer(Node):
         # Warm start the next solve by shifting the horizon forward one step
         self.U_nominal = jnp.roll(U_opt, shift=-1, axis=0)
         self.U_nominal = self.U_nominal.at[-1].set(U_opt[-1])
+
+    def costmap_speed_limit(self, state, path_xy, path_s):
+        """The fastest the costmap lets the robot go on from `state` along the path."""
+        if not self.use_costmap:
+            return self.max_speed
+        age = costmap_pose = None
+        if self.costmap is not None:
+            age = (self.get_clock().now() - self.costmap_arrival).nanoseconds * 1e-9
+            costmap_pose = {'map': (0.0, 0.0, 0.0),
+                            self._odom_frame: self._map_to_odom}.get(self.costmap.frame)
+        points = path_ahead(state, path_xy, path_s, self.progress_idx, self.clearance_lookahead)
+        limit, clearance, status = speed_limit(
+            self.costmap, age, points, costmap_pose, self.max_speed, self.slow_distance,
+            self.stop_distance, self.costmap_timeout, self.crawl_speed)
+    
+        if status in ('missing', 'unplaced', 'stale'):
+            problem = {
+                'missing': f'no costmap on {self.costmap_subscription.topic_name} yet',
+                'unplaced': f'costmap in frame "{self.costmap.frame if self.costmap else ""}", '
+                            f'neither map nor {self._odom_frame}',
+                'stale': f'costmap {age:.1f} s old',
+            }[status]
+            self.get_logger().warning(f'{problem}: speed capped at {limit:.2f} m/s',
+                                      throttle_duration_sec=5.0)
+        elif status == 'stop' and self._speed_status != 'stop':
+            self.get_logger().info(
+                f'Obstacle {clearance:.2f} m away near the path ahead: stopped until it clears')
+        elif status != 'stop' and self._speed_status == 'stop':
+            self.get_logger().info('Path ahead clear: driving on')
+        self._speed_status = status
+        return limit
 
 def main(args=None):
     rclpy.init(args=args)
