@@ -1119,7 +1119,8 @@ from autonomy.utils.reference_trajectory import process_path, get_local_referenc
 from autonomy.utils.mppi_step import mppi_step
 from autonomy.utils.dynamics import dynamics_model
 from autonomy.utils.costmap_speed import (
-    GOVERNOR_PARAMS, Costmap, governor_param_problem, path_ahead, speed_limit)
+    GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
+    speed_limit)
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
@@ -1319,7 +1320,7 @@ Speed and goal tolerances are ROS parameters. Their defaults are the values this
 | =xy_goal_tolerance=  |    0.25 | m. How close to the end of the path counts as arrived.                    |
 | =yaw_goal_tolerance= |    0.15 | rad. How closely the heading has to match the end of the path.            |
 
-The obstacle speed limit has its own (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]):
+The obstacle speed limit (see [[*Obstacle Speed Limit][Obstacle Speed Limit]]) and the braking for the end of the path have their own:
 
 | Parameter             | Default | Meaning                                                                          |
 |-----------------------+---------+----------------------------------------------------------------------------------|
@@ -1329,6 +1330,8 @@ The obstacle speed limit has its own (see [[*Obstacle Speed Limit][Obstacle Spee
 | =clearance_lookahead= |     3.0 | m. How much of the path ahead is checked.                                        |
 | =costmap_timeout=     |     1.0 | s. A costmap older than this, or none at all, caps the speed at =crawl_speed=.   |
 | =crawl_speed=         |     0.3 | m/s. The cap without a fresh costmap.                                            |
+| =goal_decel=          |     0.8 | m/s². How hard the robot plans to brake for the end of the path ([[*End of Path][End of Path]]).   |
+| =goal_creep_speed=    |    0.15 | m/s. The slowest the end-of-path taper ever asks for.                            |
 | =costmap_topic=       | =/global_costmap/costmap= | Read once at startup.                                    |
 
 With =use_costmap= true and no costmap at all (Nav2 not running), the robot only ever crawls. Set it to false to follow paths without Nav2.
@@ -1530,6 +1533,10 @@ def control_loop_callback(self):
     # it was when the solve started
     future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt) if self.last_u is not None else self.current_state
 
+    # Brake in time to stop at the end of the path (see End of Path)
+    remaining = path_s[-1] - path_progress(future_state, path_xy, path_s, self.progress_idx)
+    V_TARGET = min(V_TARGET, end_taper_speed(remaining, self.goal_decel, self.goal_creep_speed))
+
     # Obstacles near the path ahead lower the speed (see Obstacle Speed Limit).
     # A plain float: a numpy scalar would make jax compile mppi_step a second time.
     V_TARGET = float(min(V_TARGET, self.costmap_speed_limit(future_state, path_xy, path_s)))
@@ -1637,6 +1644,8 @@ GOVERNOR_PARAMS = {
     'clearance_lookahead': 3.0,   # m of path checked
     'costmap_timeout': 1.0,       # s: older than this counts as no costmap
     'crawl_speed': 0.3,           # m/s: the cap without a usable costmap
+    'goal_decel': 0.8,            # m/s^2: braking for the end of the path (End of Path)
+    'goal_creep_speed': 0.15,     # m/s: the taper never goes below this
 }
 
 # Nav2's OccupancyGrid: 100 lethal, 99 inscribed, 1-98 inflation, 0 free, -1 unknown
@@ -1668,8 +1677,12 @@ class Costmap(NamedTuple):
 
 
 def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_lookahead,
-                           costmap_timeout, crawl_speed):
+                           costmap_timeout, crawl_speed, goal_decel, goal_creep_speed):
     """Return why these settings are unusable, or None when they are fine."""
+    if not goal_decel > 0.0:
+        return f'goal_decel must be positive, got {goal_decel}'
+    if not goal_creep_speed > 0.0:
+        return f'goal_creep_speed must be positive (or the robot never reaches the goal), got {goal_creep_speed}'
     if not stop_distance >= 0.0:
         return f'stop_distance must be >= 0 m, got {stop_distance}'
     if not slow_distance > stop_distance:
@@ -1700,14 +1713,13 @@ def to_frame(points, frame_pose):
     return np.column_stack((c * d[:, 0] + s * d[:, 1], c * d[:, 1] - s * d[:, 0]))
 
 
-def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
-    """`position`, then points every `step` m along the path, from the position's projection
-    onto the path to `length` m further on (or the end of the path). Like get_local_reference,
+def path_progress(position, path_xy, path_s, start_idx):
+    """Arc length along the path of `position`'s projection onto it. Like get_local_reference,
     the projection is searched from `start_idx`, the progress so far."""
     position = np.asarray(position, dtype=float)[:2]
     end = min(len(path_xy), start_idx + 50)
     i = start_idx + int(np.argmin(np.linalg.norm(path_xy[start_idx:end] - position, axis=1)))
-    best, s0 = np.linalg.norm(path_xy[i] - position), path_s[i]
+    best, s0 = np.linalg.norm(path_xy[i] - position), float(path_s[i])
     for j in (i - 1, i):   # the segments either side of the closest point
         if 0 <= j < len(path_xy) - 1:
             a, v = path_xy[j], path_xy[j + 1] - path_xy[j]
@@ -1716,7 +1728,15 @@ def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
                 t = min(max(float((position - a) @ v) / seg2, 0.0), 1.0)
                 d = np.linalg.norm(a + t * v - position)
                 if d < best:
-                    best, s0 = d, path_s[j] + t * math.sqrt(seg2)
+                    best, s0 = d, float(path_s[j] + t * math.sqrt(seg2))
+    return s0
+
+
+def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
+    """`position`, then points every `step` m along the path, from the position's projection
+    onto the path to `length` m further on (or the end of the path)."""
+    position = np.asarray(position, dtype=float)[:2]
+    s0 = path_progress(position, path_xy, path_s, start_idx)
     s1 = min(s0 + length, path_s[-1])
     s = np.append(np.arange(s0, s1, step), s1)
     ahead = np.column_stack((np.interp(s, path_s, path_xy[:, 0]), np.interp(s, path_s, path_xy[:, 1])))
@@ -1977,6 +1997,66 @@ def costmap_speed_limit(self, state, path_xy, path_s):
         self.get_logger().info('Path ahead clear: driving on')
     self._speed_status = status
     return limit
+#+end_src
+
+*** End of Path
+The termination check stops the robot once it is within =xy_goal_tolerance= of the end of the path. Before this taper, it got there at full speed. At 1.5 m/s the zero command came too late: the robot coasted ~0.4 m and stopped 0.20-0.28 m past the end by its own estimate (TDM-25). So the target speed is now capped by the arc length left to the end of the path, $v \le \sqrt{2 a d}$ with $a$ = =goal_decel=. That is the speed from which braking at $a$ stops the robot exactly at the end. With 0.8 m/s² it starts braking 1.4 m out and reaches the tolerance circle at 0.63 m/s, where the zero command takes over. =goal_creep_speed= is a floor: when the robot reaches the end but is still outside the tolerance (off to the side, or at the wrong heading), it keeps moving instead of stalling just short.
+
+The follower can't tell a path that ends at the goal from one that local_planner will replace in half a second, so every path gets the taper. That costs nothing: local_planner aims ~12 m ahead, so its intermediate paths end well beyond the 1.4 m where the taper starts. Only the last paths, which end at the goal itself, get close enough. The taper and the obstacle limit are separate caps on the same target, and the lower one wins.
+
+Measured in the sim (TDM-37: three runs to node 1282043935 with the WGS84 EKF, ground truth):
+- The zero command now comes at 0.56-0.60 m/s. The robot rolls 0.06-0.07 m after it.
+- It stops 0.14-0.16 m short of the node, almost all of it along the path.
+- Without the taper it stopped 0.36-0.43 m past the node.
+What is left is the goal tolerance: the robot stops as soon as it is inside 0.25 m.
+
+#+begin_src python :tangle ../src/autonomy/autonomy/utils/costmap_speed.py
+
+
+def end_taper_speed(remaining, decel, creep_speed):
+    """The fastest the robot can go `remaining` m (arc length) before the end of the path and
+    still stop there braking at `decel`: sqrt(2 decel remaining), but never below creep_speed."""
+    return max(creep_speed, math.sqrt(2.0 * decel * max(remaining, 0.0)))
+#+end_src
+
+#+begin_src python :tangle ../src/autonomy/test/test_end_taper.py :mkdirp yes
+import math
+
+import numpy as np
+import pytest
+
+from autonomy.utils.costmap_speed import end_taper_speed, path_progress
+
+
+def test_taper_is_the_braking_curve():
+    assert end_taper_speed(1.40625, 0.8, 0.15) == pytest.approx(1.5)   # 1.5^2 / (2 * 0.8)
+    assert end_taper_speed(0.25, 0.8, 0.15) == pytest.approx(math.sqrt(0.4))
+    # braking from v at decel over the remaining distance ends at the path end
+    for d in (0.1, 0.5, 1.0, 3.0):
+        v = end_taper_speed(d, 0.8, 0.0)
+        assert v * v / (2 * 0.8) == pytest.approx(d)
+
+
+def test_taper_leaves_long_paths_alone():
+    # local_planner's intermediate paths end ~10-12 m ahead: far above any max_speed
+    assert end_taper_speed(10.0, 0.8, 0.15) > 1.5
+
+
+def test_taper_creeps_at_and_past_the_end():
+    assert end_taper_speed(0.0, 0.8, 0.15) == 0.15
+    assert end_taper_speed(-0.3, 0.8, 0.15) == 0.15
+    assert end_taper_speed(0.01, 0.8, 0.15) == 0.15
+
+
+def test_remaining_arc_length_along_a_bent_path():
+    # 5 m east then 5 m north, points every 0.1 m
+    east = np.column_stack((np.arange(0.0, 5.0, 0.1), np.zeros(50)))
+    north = np.column_stack((np.full(51, 5.0), np.arange(0.0, 5.0 + 1e-9, 0.1)))
+    xy = np.vstack((east, north))
+    s = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))))
+    assert s[-1] - path_progress((2.03, 0.2), xy, s, 0) == pytest.approx(7.97)
+    assert s[-1] - path_progress((5.1, 4.0), xy, s, 60) == pytest.approx(1.0)
+    assert s[-1] - path_progress((5.0, 5.4), xy, s, 90) == pytest.approx(0.0)   # past the end
 #+end_src
 
 *** Reference Trajectory

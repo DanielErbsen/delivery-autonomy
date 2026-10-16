@@ -17,7 +17,8 @@ from autonomy.utils.reference_trajectory import process_path, get_local_referenc
 from autonomy.utils.mppi_step import mppi_step
 from autonomy.utils.dynamics import dynamics_model
 from autonomy.utils.costmap_speed import (
-    GOVERNOR_PARAMS, Costmap, governor_param_problem, path_ahead, speed_limit)
+    GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
+    speed_limit)
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
@@ -260,6 +261,10 @@ class ControllerActionServer(Node):
         # Optimise from where the robot will be once this solve finishes, not where
         # it was when the solve started
         future_state = dynamics_model(self.current_state, self.last_u, dt=self.dt) if self.last_u is not None else self.current_state
+    
+        # Brake in time to stop at the end of the path (see End of Path)
+        remaining = path_s[-1] - path_progress(future_state, path_xy, path_s, self.progress_idx)
+        V_TARGET = min(V_TARGET, end_taper_speed(remaining, self.goal_decel, self.goal_creep_speed))
     
         # Obstacles near the path ahead lower the speed (see Obstacle Speed Limit).
         # A plain float: a numpy scalar would make jax compile mppi_step a second time.

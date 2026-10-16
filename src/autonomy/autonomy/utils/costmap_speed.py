@@ -12,6 +12,8 @@ GOVERNOR_PARAMS = {
     'clearance_lookahead': 3.0,   # m of path checked
     'costmap_timeout': 1.0,       # s: older than this counts as no costmap
     'crawl_speed': 0.3,           # m/s: the cap without a usable costmap
+    'goal_decel': 0.8,            # m/s^2: braking for the end of the path (End of Path)
+    'goal_creep_speed': 0.15,     # m/s: the taper never goes below this
 }
 
 # Nav2's OccupancyGrid: 100 lethal, 99 inscribed, 1-98 inflation, 0 free, -1 unknown
@@ -43,8 +45,12 @@ class Costmap(NamedTuple):
 
 
 def governor_param_problem(use_costmap, slow_distance, stop_distance, clearance_lookahead,
-                           costmap_timeout, crawl_speed):
+                           costmap_timeout, crawl_speed, goal_decel, goal_creep_speed):
     """Return why these settings are unusable, or None when they are fine."""
+    if not goal_decel > 0.0:
+        return f'goal_decel must be positive, got {goal_decel}'
+    if not goal_creep_speed > 0.0:
+        return f'goal_creep_speed must be positive (or the robot never reaches the goal), got {goal_creep_speed}'
     if not stop_distance >= 0.0:
         return f'stop_distance must be >= 0 m, got {stop_distance}'
     if not slow_distance > stop_distance:
@@ -75,14 +81,13 @@ def to_frame(points, frame_pose):
     return np.column_stack((c * d[:, 0] + s * d[:, 1], c * d[:, 1] - s * d[:, 0]))
 
 
-def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
-    """`position`, then points every `step` m along the path, from the position's projection
-    onto the path to `length` m further on (or the end of the path). Like get_local_reference,
+def path_progress(position, path_xy, path_s, start_idx):
+    """Arc length along the path of `position`'s projection onto it. Like get_local_reference,
     the projection is searched from `start_idx`, the progress so far."""
     position = np.asarray(position, dtype=float)[:2]
     end = min(len(path_xy), start_idx + 50)
     i = start_idx + int(np.argmin(np.linalg.norm(path_xy[start_idx:end] - position, axis=1)))
-    best, s0 = np.linalg.norm(path_xy[i] - position), path_s[i]
+    best, s0 = np.linalg.norm(path_xy[i] - position), float(path_s[i])
     for j in (i - 1, i):   # the segments either side of the closest point
         if 0 <= j < len(path_xy) - 1:
             a, v = path_xy[j], path_xy[j + 1] - path_xy[j]
@@ -91,7 +96,15 @@ def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
                 t = min(max(float((position - a) @ v) / seg2, 0.0), 1.0)
                 d = np.linalg.norm(a + t * v - position)
                 if d < best:
-                    best, s0 = d, path_s[j] + t * math.sqrt(seg2)
+                    best, s0 = d, float(path_s[j] + t * math.sqrt(seg2))
+    return s0
+
+
+def path_ahead(position, path_xy, path_s, start_idx, length, step=PATH_STEP):
+    """`position`, then points every `step` m along the path, from the position's projection
+    onto the path to `length` m further on (or the end of the path)."""
+    position = np.asarray(position, dtype=float)[:2]
+    s0 = path_progress(position, path_xy, path_s, start_idx)
     s1 = min(s0 + length, path_s[-1])
     s = np.append(np.arange(s0, s1, step), s1)
     ahead = np.column_stack((np.interp(s, path_s, path_xy[:, 0]), np.interp(s, path_s, path_xy[:, 1])))
@@ -145,3 +158,8 @@ def speed_limit(costmap, age, points, costmap_pose, max_speed, slow_distance, st
     if age > costmap_timeout:
         return min(limit, crawl), clearance, 'stale'
     return limit, clearance, 'stop' if limit <= 0.0 else 'slow' if limit < max_speed else 'clear'
+
+def end_taper_speed(remaining, decel, creep_speed):
+    """The fastest the robot can go `remaining` m (arc length) before the end of the path and
+    still stop there braking at `decel`: sqrt(2 decel remaining), but never below creep_speed."""
+    return max(creep_speed, math.sqrt(2.0 * decel * max(remaining, 0.0)))
