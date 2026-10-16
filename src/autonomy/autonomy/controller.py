@@ -340,7 +340,7 @@ class ControllerActionServer(Node):
         points = path_ahead(state, path_xy, path_s, self.progress_idx, self.clearance_lookahead)
         limit, clearance, status = speed_limit(
             self.costmap, age, points, costmap_pose, self.max_speed, self.slow_distance,
-            self.stop_distance, self.costmap_timeout, self.crawl_speed)
+            self.stop_distance, self.obstacle_creep_speed, self.costmap_timeout, self.crawl_speed)
     
         if status in ('missing', 'unplaced', 'stale'):
             problem = {
