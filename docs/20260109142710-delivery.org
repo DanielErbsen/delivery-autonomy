@@ -1013,9 +1013,12 @@ if __name__ == '__main__':
 * Controller
 
 #+begin_src python :noweb yes :tangle ../src/autonomy/autonomy/controller.py
+<<thread_limits>>
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from shared_types.action import FollowPath
@@ -1028,12 +1031,11 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
-import os
-os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+<<param_checks>>
 
 class ControllerActionServer(Node):
     def __init__(self):
@@ -1058,11 +1060,15 @@ class ControllerActionServer(Node):
 
         <<controller_outputs>>
 
+        <<controller_params>>
+
         <<control_vars>>
 
         self.get_logger().info('Controller Action Server initialized.')
 
     <<state_callback>>
+
+    <<on_set_parameters>>
 
     <<publish_command>>
 
@@ -1089,7 +1095,26 @@ if __name__ == '__main__':
     main()
 #+end_src
 
+** Thread Limits
+XLA and OpenBLAS size their thread pools once, when jax and numpy first load, so these lines come before every other import. Further down the file was too late: =autonomy.utils.dynamics= imports jax, =mppi_step= builds a jax array at import (which starts the XLA backend and parses =XLA_FLAGS=), and the ROS message modules import numpy. The old settings sat below those imports and never took effect.
+
+- ~--xla_cpu_multi_thread_eigen=false~ keeps XLA's Eigen-backed ops (matrix products) on one thread.
+- =PJRT_NPROC= sizes XLA's CPU thread pools, which otherwise get one thread per core.
+- =OPENBLAS_NUM_THREADS= caps numpy's BLAS pool. The pip OpenBLAS on the Pi starts one thread per core as numpy loads. Nix's OpenBLAS is built with OpenMP and reads =OMP_NUM_THREADS= instead, so both are set.
+
+The MPPI step is effectively single-threaded anyway. On the laptop it takes about 40 ms with 12 pool threads or 2, so the limits cost nothing: they only stop jax from claiming every core next to the EKF and Nav2. =setdefault= leaves a value that is already in the environment alone, so the shell or launch file can override them, e.g. ~PJRT_NPROC=4 ros2 run autonomy controller~. The old ~intra_op_parallelism_threads=2~ was a TensorFlow session option. XLA ignored it without complaint.
+
+#+name: thread_limits
+#+begin_src python
+import os
+os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+os.environ.setdefault("PJRT_NPROC", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+#+end_src
+
 ** Action
+A path is followed until the robot is within the goal tolerances of its last pose. Then the goal succeeds with =success= true. Only the newest goal is ever open. A goal that arrives while another is running takes over the path, and the replaced goal finishes at once, *aborted* with =success= false. ROS 2 actions have no "preempted" status, and Nav2's own servers abort a goal they preempt, so clients get the same answer here. =local_planner= replans about once a second; before this change every one of those goals stayed open until the robot arrived. An empty path is an order to stop. The controller zeroes the command at once and the empty goal itself succeeds.
 
 # The file source type is arbitrary for Emacs here.
 #+begin_src bash :tangle ../src/shared_types/action/FollowPath.action
@@ -1157,6 +1182,95 @@ def process_state_callback(self, odom_msg: Odometry):
     self.current_state = np.array([x, y, theta, v, omega, b_omega])
 #+end_src
 
+** Parameters
+Speed and goal tolerances are ROS parameters. Their defaults are the values this controller always used.
+
+| Parameter            | Default | Meaning                                                                   |
+|----------------------+---------+---------------------------------------------------------------------------|
+| =max_speed=          |     1.5 | m/s. The cruise speed MPPI tracks, and the forward cap on =/cmd_vel=.     |
+| =min_speed=          |    -0.5 | m/s. The reverse cap on =/cmd_vel=. 0 forbids reversing.                  |
+| =xy_goal_tolerance=  |    0.25 | m. How close to the end of the path counts as arrived.                    |
+| =yaw_goal_tolerance= |    0.15 | rad. How closely the heading has to match the end of the path.            |
+
+They can be set at launch (e.g. ~max_speed:=0.8~; write doubles, ~1.0~ not ~1~) or changed while running with ~ros2 param set /controller_server max_speed 0.8~. A value that fails the checks below is refused: at startup the node will not start, and at runtime the set is rejected with the reason. Speeds are checked against MPPI's sampling bounds because MPPI never samples outside them, so a cap beyond them would never be reached. =min_speed= may not be positive, or the stop command (zero) would be clipped into motion.
+
+The vehicle geometry is *not* a parameter. =WHEELBASE= and =MAX_STEER= (=utils/dynamics.py=), the sampling bounds and MPPI's own constants are compiled into the jitted step. =steering_wheel_base= below has to match =WHEELBASE=. They describe the simulated vehicle (0.5 m, 0.6 rad). The real robot is 0.363 m and 0.436 rad, so changing them is a code change.
+
+#+name: param_checks
+#+begin_src python
+CONTROLLER_PARAMS = {
+    'max_speed': 1.5,
+    'min_speed': -0.5,
+    'xy_goal_tolerance': 0.25,
+    'yaw_goal_tolerance': 0.15,
+}
+
+# The speed bounds MPPI samples within (lower_bounds / upper_bounds in mppi_step)
+MPPI_MIN_SPEED, MPPI_MAX_SPEED = -0.5, 1.5
+
+def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_tolerance):
+    """Return why these settings are unusable, or None when they are fine."""
+    if not 0.0 < max_speed <= MPPI_MAX_SPEED:
+        return f'max_speed must be in (0, {MPPI_MAX_SPEED}] m/s, got {max_speed}'
+    if not MPPI_MIN_SPEED <= min_speed <= 0.0:
+        return f'min_speed must be in [{MPPI_MIN_SPEED}, 0] m/s, got {min_speed}'
+    if not xy_goal_tolerance > 0.0:
+        return f'xy_goal_tolerance must be positive, got {xy_goal_tolerance}'
+    if not yaw_goal_tolerance > 0.0:
+        return f'yaw_goal_tolerance must be positive, got {yaw_goal_tolerance}'
+    return None
+#+end_src
+
+The checks don't touch ROS, so they get a plain pytest (=python -m pytest src/autonomy/test= with the workspace sourced).
+
+#+begin_src python :tangle ../src/autonomy/test/test_controller_params.py :mkdirp yes
+from autonomy.controller import CONTROLLER_PARAMS, controller_param_problem
+
+
+def test_defaults_are_accepted():
+    assert controller_param_problem(**CONTROLLER_PARAMS) is None
+
+
+def test_speeds_must_stay_inside_mppi_bounds():
+    for name, value in [('max_speed', 0.0), ('max_speed', -0.3), ('max_speed', 1.6),
+                        ('min_speed', 0.1), ('min_speed', -0.6)]:
+        assert controller_param_problem(**{**CONTROLLER_PARAMS, name: value}) is not None, (name, value)
+
+
+def test_slow_and_forward_only_settings_are_accepted():
+    assert controller_param_problem(**{**CONTROLLER_PARAMS, 'max_speed': 0.8, 'min_speed': 0.0}) is None
+
+
+def test_tolerances_must_be_positive():
+    for name in ('xy_goal_tolerance', 'yaw_goal_tolerance'):
+        assert controller_param_problem(**{**CONTROLLER_PARAMS, name: 0.0}) is not None, name
+#+end_src
+
+#+name: controller_params
+#+begin_src python
+for name, default in CONTROLLER_PARAMS.items():
+    setattr(self, name, self.declare_parameter(name, default).value)
+problem = controller_param_problem(**{name: getattr(self, name) for name in CONTROLLER_PARAMS})
+if problem:
+    raise ValueError(problem)
+self.add_on_set_parameters_callback(self.on_set_parameters)
+#+end_src
+
+A runtime change is checked together with the values it leaves unchanged, then applied all at once or not at all.
+
+#+name: on_set_parameters
+#+begin_src python
+def on_set_parameters(self, params):
+    settings = {name: getattr(self, name) for name in CONTROLLER_PARAMS}
+    settings.update((p.name, p.value) for p in params if p.name in settings)
+    problem = controller_param_problem(**settings)
+    if problem:
+        return SetParametersResult(successful=False, reason=problem)
+    for name, value in settings.items():
+        setattr(self, name, value)
+    return SetParametersResult(successful=True)
+#+end_src
+
 ** Output
 #+NAME: controller_outputs
 #+begin_src python
@@ -1164,6 +1278,8 @@ self.cmd_pub = self.create_publisher(
     Twist, "/cmd_vel", 10
 )
 #+end_src
+
+Whatever MPPI asks for, the speed sent is held between =min_speed= and =max_speed=.
 
 #+name: publish_command
 #+begin_src python
@@ -1173,9 +1289,8 @@ def publish_command(self, u):
     v_cmd_float = float(v_cmd)
     delta_float = float(delta)
 
-    V_LIMIT = 1.5 # TODO: make param
     max_steer = 0.6
-    v_cmd_float = max(min(v_cmd_float, V_LIMIT), -V_LIMIT)
+    v_cmd_float = max(min(v_cmd_float, self.max_speed), self.min_speed)
     delta_clipped = np.clip(delta_float, -max_steer, max_steer)
     omega = (v_cmd_float / self.steering_wheel_base) * np.tan(delta_clipped)
 
@@ -1187,30 +1302,42 @@ def publish_command(self, u):
     self.cmd_pub.publish(cmd_vel)
 #+end_src
 
+Each goal waits on a future of its own. The control loop resolves it with =True= when the robot arrives. The next goal resolves it with =False=, so a replaced goal finishes the moment it is replaced (see [[*Action][Action]]). An empty path is handled right here and not in the control loop: the stop then goes out even when there is no pose yet, and without waiting for the next tick.
+
 #+name: execute_controller_callback
 #+begin_src python :noweb yes
 async def execute_callback(self, goal_handle):
-    self.get_logger().info('Received a new path to follow!')
-
     path = process_path(goal_handle.request.path)
+
+    # Only the newest goal stays open: the one it replaces finishes now
+    self._finish_goal(reached=False)
+
+    if len(path[0]) == 0:
+        self.get_logger().info('Received an empty path. Stopping robot.')
+        self.active_goal = False
+        self.publish_command(np.zeros(INPUT_DIMENSION))
+        goal_handle.succeed()
+        return FollowPath.Result(success=True)
+
+    self.get_logger().info('Received a new path to follow!')
     self.current_path = path
     self.progress_idx = 0
-    # A goal that arrives mid-run takes over the path and waits on the same completion
-    if self._goal_done is None or self._goal_done.done():
-        self._goal_done = Future()
-    done = self._goal_done
+    done = self._goal_done = Future()
     self.active_goal = True
 
-    # Wait without blocking the single-threaded executor; the control loop resolves it
-    await done
+    # Wait without blocking the single-threaded executor
+    reached = await done
 
-    goal_handle.succeed()
-    return FollowPath.Result(success=True)
+    if reached:
+        goal_handle.succeed()
+    else:
+        goal_handle.abort()
+    return FollowPath.Result(success=reached)
 
-def _finish_goal(self):
-    self.active_goal = False
-    if self._goal_done is not None and not self._goal_done.done():
-        self._goal_done.set_result(True)
+def _finish_goal(self, reached):
+    done, self._goal_done = self._goal_done, None
+    if done is not None and not done.done():
+        done.set_result(reached)
 #+end_src
 
 ** Control Loop
@@ -1242,20 +1369,11 @@ def control_loop_callback(self):
 
     path_xy, path_theta_unwrapped, path_s = self.current_path
 
-    if len(path_xy) == 0:
-        self.get_logger().warning("Received empty path. Stopping robot.")
-        self.publish_command(jnp.zeros(INPUT_DIMENSION)) 
-        self._finish_goal()
-        return
-
     # doesn't have to be calculated every step but minimal overhead
     goal_x, goal_y = path_xy[-1]
     goal_theta = path_theta_unwrapped[-1]
 
-    # TODO: make params
-    xy_goal_tolerance = 0.25  # meters
-    yaw_goal_tolerance = 0.15 # radians
-    V_TARGET = 1.5
+    V_TARGET = self.max_speed
 
     <<check_control_done>>
 
@@ -1285,10 +1403,9 @@ def control_loop_callback(self):
         v_target=V_TARGET,
     )
 
-    # TODO: make params
     # [min_v, min_delta]
-    lower_bounds = jnp.array([-0.5, -0.6])
-    upper_bounds = jnp.array([1.5, 0.6])
+    lower_bounds = jnp.array([self.min_speed, -0.6])
+    upper_bounds = jnp.array([self.max_speed, 0.6])
     U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
 
     u = U_opt[0]
@@ -1301,6 +1418,8 @@ def control_loop_callback(self):
 #+end_src
 
 *** Check Termination
+The check uses the pose the EKF gives it, so it can only be as close as the EKF is right. In TDM-25's sim runs the robot stopped 0.43-0.50 m from the goal node by ground truth. The EKF put it 0.22 m away, inside the 0.25 m tolerance, so this check did its job. The gap is EKF error: about 0.15 m of lag at speed plus a 0.25 m offset. The robot also arrives at full speed and coasts about 0.4 m after the zero command, so it ends level with or past the goal, not short of it. A tighter tolerance would fix neither. Slowing down before the end of the path would shorten the coast.
+
 #+name: check_control_done
 #+begin_src python
 # Assuming state is [x, y, theta, v, omega, b_omega]
@@ -1312,11 +1431,12 @@ dist_to_goal = np.hypot(goal_x - curr_x, goal_y - curr_y)
 yaw_err = abs((curr_theta - goal_theta + np.pi) % (2 * np.pi) - np.pi)
 
 # Check termination condition
-if dist_to_goal < xy_goal_tolerance and yaw_err < yaw_goal_tolerance:
+if dist_to_goal < self.xy_goal_tolerance and yaw_err < self.yaw_goal_tolerance:
     # Stop the motors
-    self.publish_command(np.zeros(INPUT_DIMENSION)) 
+    self.publish_command(np.zeros(INPUT_DIMENSION))
 
-    self._finish_goal()
+    self.active_goal = False
+    self._finish_goal(reached=True)
     return
 #+end_src
 

@@ -1,6 +1,13 @@
+import os
+os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+os.environ.setdefault("PJRT_NPROC", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from shared_types.action import FollowPath
@@ -13,12 +20,31 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
-import os
-os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+CONTROLLER_PARAMS = {
+    'max_speed': 1.5,
+    'min_speed': -0.5,
+    'xy_goal_tolerance': 0.25,
+    'yaw_goal_tolerance': 0.15,
+}
+
+# The speed bounds MPPI samples within (lower_bounds / upper_bounds in mppi_step)
+MPPI_MIN_SPEED, MPPI_MAX_SPEED = -0.5, 1.5
+
+def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_tolerance):
+    """Return why these settings are unusable, or None when they are fine."""
+    if not 0.0 < max_speed <= MPPI_MAX_SPEED:
+        return f'max_speed must be in (0, {MPPI_MAX_SPEED}] m/s, got {max_speed}'
+    if not MPPI_MIN_SPEED <= min_speed <= 0.0:
+        return f'min_speed must be in [{MPPI_MIN_SPEED}, 0] m/s, got {min_speed}'
+    if not xy_goal_tolerance > 0.0:
+        return f'xy_goal_tolerance must be positive, got {xy_goal_tolerance}'
+    if not yaw_goal_tolerance > 0.0:
+        return f'yaw_goal_tolerance must be positive, got {yaw_goal_tolerance}'
+    return None
 
 class ControllerActionServer(Node):
     def __init__(self):
@@ -54,6 +80,13 @@ class ControllerActionServer(Node):
         self.cmd_pub = self.create_publisher(
             Twist, "/cmd_vel", 10
         )
+
+        for name, default in CONTROLLER_PARAMS.items():
+            setattr(self, name, self.declare_parameter(name, default).value)
+        problem = controller_param_problem(**{name: getattr(self, name) for name in CONTROLLER_PARAMS})
+        if problem:
+            raise ValueError(problem)
+        self.add_on_set_parameters_callback(self.on_set_parameters)
 
         self.T = 50 # TODO: make param
         self.steering_wheel_base = 0.5  # Must match <wheel_base> in robot.urdf.xacro
@@ -104,15 +137,24 @@ class ControllerActionServer(Node):
     
         self.current_state = np.array([x, y, theta, v, omega, b_omega])
 
+    def on_set_parameters(self, params):
+        settings = {name: getattr(self, name) for name in CONTROLLER_PARAMS}
+        settings.update((p.name, p.value) for p in params if p.name in settings)
+        problem = controller_param_problem(**settings)
+        if problem:
+            return SetParametersResult(successful=False, reason=problem)
+        for name, value in settings.items():
+            setattr(self, name, value)
+        return SetParametersResult(successful=True)
+
     def publish_command(self, u):
         v_cmd, delta = u
     
         v_cmd_float = float(v_cmd)
         delta_float = float(delta)
     
-        V_LIMIT = 1.5 # TODO: make param
         max_steer = 0.6
-        v_cmd_float = max(min(v_cmd_float, V_LIMIT), -V_LIMIT)
+        v_cmd_float = max(min(v_cmd_float, self.max_speed), self.min_speed)
         delta_clipped = np.clip(delta_float, -max_steer, max_steer)
         omega = (v_cmd_float / self.steering_wheel_base) * np.tan(delta_clipped)
     
@@ -124,27 +166,37 @@ class ControllerActionServer(Node):
         self.cmd_pub.publish(cmd_vel)
 
     async def execute_callback(self, goal_handle):
-        self.get_logger().info('Received a new path to follow!')
-    
         path = process_path(goal_handle.request.path)
+    
+        # Only the newest goal stays open: the one it replaces finishes now
+        self._finish_goal(reached=False)
+    
+        if len(path[0]) == 0:
+            self.get_logger().info('Received an empty path. Stopping robot.')
+            self.active_goal = False
+            self.publish_command(np.zeros(INPUT_DIMENSION))
+            goal_handle.succeed()
+            return FollowPath.Result(success=True)
+    
+        self.get_logger().info('Received a new path to follow!')
         self.current_path = path
         self.progress_idx = 0
-        # A goal that arrives mid-run takes over the path and waits on the same completion
-        if self._goal_done is None or self._goal_done.done():
-            self._goal_done = Future()
-        done = self._goal_done
+        done = self._goal_done = Future()
         self.active_goal = True
     
-        # Wait without blocking the single-threaded executor; the control loop resolves it
-        await done
+        # Wait without blocking the single-threaded executor
+        reached = await done
     
-        goal_handle.succeed()
-        return FollowPath.Result(success=True)
+        if reached:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        return FollowPath.Result(success=reached)
     
-    def _finish_goal(self):
-        self.active_goal = False
-        if self._goal_done is not None and not self._goal_done.done():
-            self._goal_done.set_result(True)
+    def _finish_goal(self, reached):
+        done, self._goal_done = self._goal_done, None
+        if done is not None and not done.done():
+            done.set_result(reached)
 
     def control_loop_callback(self):
         if not self.active_goal or self.current_state is None:
@@ -152,20 +204,11 @@ class ControllerActionServer(Node):
     
         path_xy, path_theta_unwrapped, path_s = self.current_path
     
-        if len(path_xy) == 0:
-            self.get_logger().warning("Received empty path. Stopping robot.")
-            self.publish_command(jnp.zeros(INPUT_DIMENSION)) 
-            self._finish_goal()
-            return
-    
         # doesn't have to be calculated every step but minimal overhead
         goal_x, goal_y = path_xy[-1]
         goal_theta = path_theta_unwrapped[-1]
     
-        # TODO: make params
-        xy_goal_tolerance = 0.25  # meters
-        yaw_goal_tolerance = 0.15 # radians
-        V_TARGET = 1.5
+        V_TARGET = self.max_speed
     
         # Assuming state is [x, y, theta, v, omega, b_omega]
         curr_x, curr_y = self.current_state[0], self.current_state[1]
@@ -176,11 +219,12 @@ class ControllerActionServer(Node):
         yaw_err = abs((curr_theta - goal_theta + np.pi) % (2 * np.pi) - np.pi)
         
         # Check termination condition
-        if dist_to_goal < xy_goal_tolerance and yaw_err < yaw_goal_tolerance:
+        if dist_to_goal < self.xy_goal_tolerance and yaw_err < self.yaw_goal_tolerance:
             # Stop the motors
-            self.publish_command(np.zeros(INPUT_DIMENSION)) 
+            self.publish_command(np.zeros(INPUT_DIMENSION))
         
-            self._finish_goal()
+            self.active_goal = False
+            self._finish_goal(reached=True)
             return
     
         # Optimise from where the robot will be once this solve finishes, not where
@@ -209,10 +253,9 @@ class ControllerActionServer(Node):
             v_target=V_TARGET,
         )
     
-        # TODO: make params
         # [min_v, min_delta]
-        lower_bounds = jnp.array([-0.5, -0.6])
-        upper_bounds = jnp.array([1.5, 0.6])
+        lower_bounds = jnp.array([self.min_speed, -0.6])
+        upper_bounds = jnp.array([self.max_speed, 0.6])
         U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
     
         u = U_opt[0]
