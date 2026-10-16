@@ -17,8 +17,8 @@ from autonomy.utils.reference_trajectory import process_path, get_local_referenc
 from autonomy.utils.mppi_step import charged_steps, crop_window, free_window, mppi_step
 from autonomy.utils.dynamics import VEHICLE_PARAMS, Vehicle, dynamics_model, vehicle_param_problem
 from autonomy.utils.costmap_speed import (
-    GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
-    speed_limit)
+    GOVERNOR_PARAMS, OBSTACLE_MEMORY, Costmap, end_taper_speed, governor_param_problem, path_ahead,
+    path_progress, remembered_costmap, speed_limit)
 import time
 from tf2_ros import Buffer, TransformListener, TransformException
 from rclpy.task import Future
@@ -96,6 +96,8 @@ class ControllerActionServer(Node):
         
         self.costmap = None
         self.costmap_arrival = None
+        self._recent_costmaps = []
+        self.costmap_remembered = None
         self.costmap_subscription = self.create_subscription(
             OccupancyGrid,
             costmap_topic,
@@ -172,8 +174,15 @@ class ControllerActionServer(Node):
         self.current_state = np.array([x, y, theta, v, omega, b_omega])
 
     def process_costmap_callback(self, msg: OccupancyGrid):
-        self.costmap = Costmap.from_msg(msg)
-        self.costmap_arrival = self.get_clock().now()
+        costmap = Costmap.from_msg(msg)
+        arrival = self.get_clock().now()
+        # The speed limit goes by every obstacle cell of the last OBSTACLE_MEMORY seconds
+        recent = [(t, c) for t, c in self._recent_costmaps
+                  if 0.0 <= (arrival - t).nanoseconds * 1e-9 <= OBSTACLE_MEMORY]
+        recent.append((arrival, costmap))
+        self._recent_costmaps = recent
+        self.costmap_remembered = remembered_costmap([c for _, c in recent])
+        self.costmap, self.costmap_arrival = costmap, arrival
 
     def on_set_parameters(self, params):
         settings = {name: getattr(self, name) for name in self.param_names}
@@ -339,8 +348,8 @@ class ControllerActionServer(Node):
                             self._odom_frame: self._map_to_odom}.get(self.costmap.frame)
         points = path_ahead(state, path_xy, path_s, self.progress_idx, self.clearance_lookahead)
         limit, clearance, status = speed_limit(
-            self.costmap, age, points, costmap_pose, self.max_speed, self.slow_distance,
-            self.stop_distance, self.costmap_timeout, self.crawl_speed)
+            self.costmap_remembered, age, points, costmap_pose, self.max_speed, self.slow_distance,
+            self.stop_distance, self.obstacle_creep_speed, self.costmap_timeout, self.crawl_speed)
     
         if status in ('missing', 'unplaced', 'stale'):
             problem = {
