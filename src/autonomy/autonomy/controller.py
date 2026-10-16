@@ -14,7 +14,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from shared_types.action import FollowPath
 from autonomy.utils.dynamics import INPUT_DIMENSION
 from autonomy.utils.reference_trajectory import process_path, get_local_reference
-from autonomy.utils.mppi_step import mppi_step
+from autonomy.utils.mppi_step import charged_steps, crop_window, free_window, mppi_step
 from autonomy.utils.dynamics import dynamics_model
 from autonomy.utils.costmap_speed import (
     GOVERNOR_PARAMS, Costmap, end_taper_speed, governor_param_problem, path_ahead, path_progress,
@@ -35,7 +35,7 @@ CONTROLLER_PARAMS = {
     'yaw_goal_tolerance': 0.15,
 }
 
-# The speed bounds MPPI samples within (lower_bounds / upper_bounds in mppi_step)
+# The speeds MPPI is tuned for. Up to 1.5 m/s its rollouts stay inside the costmap window.
 MPPI_MIN_SPEED, MPPI_MAX_SPEED = -0.5, 1.5
 
 def controller_param_problem(max_speed, min_speed, xy_goal_tolerance, yaw_goal_tolerance):
@@ -128,6 +128,7 @@ class ControllerActionServer(Node):
         self._map_to_odom = None
         self._odom_frame = None
         self._speed_status = None
+        self._free_window = free_window()
 
         self.get_logger().info('Controller Action Server initialized.')
 
@@ -291,7 +292,7 @@ class ControllerActionServer(Node):
         self.rng, iter_key = jax.random.split(self.rng)
     
         # [min_v, min_delta]. The speed cap is this tick's target, so a lowered target
-        # caps the command too.
+        # caps the command too. MPPI samples within the same bounds (see MPPI).
         lower_bounds = jnp.array([self.min_speed, -0.6])
         upper_bounds = jnp.array([V_TARGET, 0.6])
     
@@ -302,6 +303,12 @@ class ControllerActionServer(Node):
             U_nominal=jnp.clip(self.U_nominal, lower_bounds, upper_bounds),
             ref_traj=ref_traj_jax,
             v_target=V_TARGET,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            # The costmap round the robot, for MPPI's obstacle cost, which stops counting where
+            # a rollout could have reached the end of the path (see Obstacle Cost)
+            window=self.mppi_costmap_window(future_state),
+            obstacle_steps=charged_steps(remaining, V_TARGET, self.T),
         )
     
         U_opt = jnp.clip(U_opt, lower_bounds, upper_bounds)
@@ -344,6 +351,17 @@ class ControllerActionServer(Node):
             self.get_logger().info('Path ahead clear: driving on')
         self._speed_status = status
         return limit
+
+    def mppi_costmap_window(self, state):
+        """The costmap round `state` for MPPI's obstacle cost, or an all-free window when the
+        costmap is off, missing, stale or in a frame the controller cannot place."""
+        if not self.use_costmap or self.costmap is None:
+            return self._free_window
+        age = (self.get_clock().now() - self.costmap_arrival).nanoseconds * 1e-9
+        frame_pose = {'map': (0.0, 0.0, 0.0), self._odom_frame: self._map_to_odom}.get(self.costmap.frame)
+        if age > self.costmap_timeout or frame_pose is None:
+            return self._free_window
+        return crop_window(self.costmap, state, frame_pose)
 
 def main(args=None):
     rclpy.init(args=args)
